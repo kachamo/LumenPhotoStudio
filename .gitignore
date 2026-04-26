@@ -1,0 +1,14 @@
+build/
+*.exe
+*.dll
+*.o
+*.obj
+*.user
+*.autosave
+.DS_Store
+__pycache__/
+*.pyc
+output/
+temp/
+cache/
+logs/
