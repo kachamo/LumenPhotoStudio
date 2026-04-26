@@ -161,21 +161,37 @@ void CurveParams::clampRanges()
 // ---- Grading ----------------------------------------------------------------
 bool GradingParams::isIdentity() const
 {
-    const bool lutActive  = !lutPath.isEmpty()       && lutOpacity        > 1e-4f;
+    // LUT counts as active only when enabled, set, and visible.
+    const bool lutActive  = lutEnabled && !lutPath.isEmpty() && lutOpacity > 1e-4f;
     const bool filmActive = !filmProfileId.isEmpty() && filmProfileOpacity > 1e-4f;
 
-    // Per-wheel activity check: a wheel produces a tint only when BOTH
-    // saturation and strength are non-zero. Either at zero is identity.
-    auto wheelActive = [](float sat, float str) {
-        return sat > 1e-4f && str > 1e-4f;
+    // Per-wheel activity check: a wheel produces a color tint only when BOTH
+    // saturation and strength are non-zero. Either at zero produces no
+    // *tint*, but luminance is independent — a non-zero luminance still
+    // changes the image even with sat=0.
+    auto wheelActive = [](float sat, float str, float lum) {
+        return (sat > 1e-4f && str > 1e-4f) || !nearZero(lum);
     };
     const bool wheelsActive =
-        wheelActive(shadowsSaturation,    shadowsStrength)    ||
-        wheelActive(midtonesSaturation,   midtonesStrength)   ||
-        wheelActive(highlightsSaturation, highlightsStrength) ||
-        wheelActive(globalSaturation,     globalStrength);
+        wheelActive(shadowsSaturation,    shadowsStrength,    shadowsLuminance)    ||
+        wheelActive(midtonesSaturation,   midtonesStrength,   midtonesLuminance)   ||
+        wheelActive(highlightsSaturation, highlightsStrength, highlightsLuminance) ||
+        wheelActive(globalSaturation,     globalStrength,     globalLuminance);
 
-    return !lutActive && !filmActive && !wheelsActive;
+    // Advanced + filmic placeholders: V1 doesn't render them, but the
+    // identity check honors them anyway so an "active" non-zero advanced
+    // value still marks the Look non-identity (relevant for "Reset all"
+    // detection and unsaved-changes prompts).
+    const bool advActive =
+        !nearZero(lift) || !nearZero(gamma) ||
+        !nearZero(gain) || !nearZero(offset);
+    const bool filmicActive =
+        !nearZero(filmicContrast)   || !nearZero(highlightRolloff) ||
+        !nearZero(shadowLift)       || !nearZero(fadeBlacks)       ||
+        !nearZero(colorSeparation);
+
+    return !lutActive && !filmActive && !wheelsActive
+        && !advActive && !filmicActive;
 }
 
 void GradingParams::clampRanges()
@@ -196,15 +212,31 @@ void GradingParams::clampRanges()
 
     shadowsSaturation    = clamp(shadowsSaturation,    0.0f, 100.0f);
     shadowsStrength      = clamp(shadowsStrength,      0.0f, 100.0f);
+    shadowsLuminance     = clamp(shadowsLuminance,    -100.0f, 100.0f);
     midtonesSaturation   = clamp(midtonesSaturation,   0.0f, 100.0f);
     midtonesStrength     = clamp(midtonesStrength,     0.0f, 100.0f);
+    midtonesLuminance    = clamp(midtonesLuminance,   -100.0f, 100.0f);
     highlightsSaturation = clamp(highlightsSaturation, 0.0f, 100.0f);
     highlightsStrength   = clamp(highlightsStrength,   0.0f, 100.0f);
+    highlightsLuminance  = clamp(highlightsLuminance, -100.0f, 100.0f);
     globalSaturation     = clamp(globalSaturation,     0.0f, 100.0f);
     globalStrength       = clamp(globalStrength,       0.0f, 100.0f);
+    globalLuminance      = clamp(globalLuminance,    -100.0f, 100.0f);
 
     balance  = clamp(balance,  -100.0f, 100.0f);
     blending = clamp(blending,    0.0f, 100.0f);
+
+    // Advanced + filmic placeholders.
+    lift   = clamp(lift,   -100.0f, 100.0f);
+    gamma  = clamp(gamma,  -100.0f, 100.0f);
+    gain   = clamp(gain,   -100.0f, 100.0f);
+    offset = clamp(offset, -100.0f, 100.0f);
+
+    filmicContrast   = clamp(filmicContrast,   -100.0f, 100.0f);
+    highlightRolloff = clamp(highlightRolloff, -100.0f, 100.0f);
+    shadowLift       = clamp(shadowLift,       -100.0f, 100.0f);
+    fadeBlacks       = clamp(fadeBlacks,       -100.0f, 100.0f);
+    colorSeparation  = clamp(colorSeparation,  -100.0f, 100.0f);
 }
 
 // ---- Effects ----------------------------------------------------------------
@@ -245,14 +277,110 @@ void EffectsParams::clampRanges()
     clarity.clampRanges();
 }
 
-// ---- Look -------------------------------------------------------------------
-bool Look::isIdentity() const
+// ---- LocalAdjustment --------------------------------------------------------
+// A mask is "identity" (skippable) when disabled, or when all adjustment
+// values are at zero — in either case it can't affect the output.
+//
+// We don't check geometry here; an enabled mask with non-zero adjustments
+// is always considered active, even if its mask weight is zero everywhere
+// (a degenerate gradient with start==end, or a radial with radius=0). The
+// engine handles those edge cases at apply time.
+bool LocalAdjustment::isIdentity() const
+{
+    if (!enabled) return true;
+    return nearZero(exposure)   && nearZero(brightness)
+        && nearZero(contrast)   && nearZero(saturation)
+        && nearZero(temperature) && nearZero(tint);
+}
+
+void LocalAdjustment::clampRanges()
+{
+    // Geometry coordinates must stay finite but aren't strictly bounded —
+    // a user could drag a gradient endpoint outside the image area for a
+    // wider falloff. We clamp to a generous range that still keeps the math
+    // well-behaved.
+    auto clampPoint = [](QPointF& p) {
+        p.setX(clamp(static_cast<float>(p.x()), -10.0f, 10.0f));
+        p.setY(clamp(static_cast<float>(p.y()), -10.0f, 10.0f));
+    };
+    clampPoint(startPoint);
+    clampPoint(endPoint);
+    clampPoint(center);
+    radius  = clamp(radius,  1e-4f, 10.0f);   // tiny min keeps math finite
+    feather = clamp(feather, 0.0f,  1.0f);
+    density = clamp(density, 0.0f,  1.0f);
+    flow    = clamp(flow,    0.0f,  1.0f);
+    // invert is bool; nothing to clamp.
+
+    exposure    = clamp(exposure,    -10.0f, +10.0f);
+    brightness  = clamp(brightness,  -100.0f, +100.0f);
+    contrast    = clamp(contrast,    -100.0f, +100.0f);
+    saturation  = clamp(saturation,  -100.0f, +100.0f);
+    temperature = clamp(temperature, -100.0f, +100.0f);
+    tint        = clamp(tint,        -100.0f, +100.0f);
+}
+
+// ---- LayerAdjustmentData ---------------------------------------------------
+// Flat per-layer adjustment payload. Identity = every sub-struct is identity.
+// clampRanges and reset just delegate to each sub-struct's helper.
+bool LayerAdjustmentData::isIdentity() const
 {
     return tone.isIdentity()
         && color.isIdentity()
         && curves.isIdentity()
         && grading.isIdentity()
         && effects.isIdentity();
+}
+
+void LayerAdjustmentData::clampRanges()
+{
+    tone.clampRanges();
+    color.clampRanges();
+    curves.clampRanges();
+    grading.clampRanges();
+    effects.clampRanges();
+}
+
+void LayerAdjustmentData::reset()
+{
+    *this = LayerAdjustmentData{};
+}
+
+// ---- AdjustmentLayer --------------------------------------------------------
+// A layer is "identity" (skippable) when disabled, has zero opacity, or
+// its payload is identity. Layer rendering can fast-path skip on this.
+bool AdjustmentLayer::isIdentity() const
+{
+    if (!enabled) return true;
+    if (opacity <= 1e-4f) return true;
+    return adjustmentData.isIdentity();
+}
+
+void AdjustmentLayer::clampRanges()
+{
+    opacity = clamp(opacity, 0.0f, 1.0f);
+    adjustmentData.clampRanges();
+    // blendMode is a discrete enum; values outside the known set are
+    // clamped at deserialize time, not here.
+}
+
+// ---- Look -------------------------------------------------------------------
+bool Look::isIdentity() const
+{
+    if (!tone.isIdentity())    return false;
+    if (!color.isIdentity())   return false;
+    if (!curves.isIdentity())  return false;
+    if (!grading.isIdentity()) return false;
+    if (!effects.isIdentity()) return false;
+    // Any active local adjustment makes the Look non-identity.
+    for (const auto& la : localAdjustments) {
+        if (!la.isIdentity()) return false;
+    }
+    // Any active adjustment layer makes the Look non-identity.
+    for (const auto& al : adjustmentLayers) {
+        if (!al.isIdentity()) return false;
+    }
+    return true;
 }
 
 void Look::clampRanges()
@@ -262,6 +390,8 @@ void Look::clampRanges()
     curves.clampRanges();
     grading.clampRanges();
     effects.clampRanges();
+    for (auto& la : localAdjustments) la.clampRanges();
+    for (auto& al : adjustmentLayers) al.clampRanges();
 }
 
 void Look::reset()

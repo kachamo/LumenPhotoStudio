@@ -17,6 +17,7 @@
 #include "color/ColorEngine.h"
 #include "curve/CurveEngine.h"
 #include "effects/EffectsEngine.h"
+#include "local/LocalAdjustmentEngine.h"
 #include "grading/ColorGrading.h"
 #include "tone/ToneEngine.h"
 
@@ -92,6 +93,12 @@ RenderResult ImagePipeline::renderUpTo(const QImage& input, Look look, Stage sta
         result.elapsedMs = timer.nsecsElapsed() / 1'000'000.0;
         return result;
     }
+
+    // Local masks slot between curves and grading. Per spec: "after global
+    // tone/color but before grading." Each mask layers on the previous
+    // result via masked lerp; LocalAdjustmentEngine internally early-outs
+    // for empty/disabled mask lists.
+    LocalAdjustmentEngine::apply(buffer, look.localAdjustments);
 
     ColorGrading::apply(buffer, look.grading);
     if (stage == Stage::AfterGrading) {

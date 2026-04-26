@@ -82,6 +82,11 @@ set(LPS_SOURCES
     src/effects/Clarity.h
     src/effects/Clarity.cpp
 
+    # local/
+    src/local/LocalAdjustmentEngine.h
+    src/local/LocalAdjustmentEngine.cpp
+    src/local/MaskGeometry.h
+
     # preset/
     src/preset/PresetManager.h
     src/preset/PresetManager.cpp
@@ -127,6 +132,8 @@ set(LUMEN_UI_SOURCES
     ui/EmptyStateOverlay.cpp
     ui/PreviewWidget.h
     ui/PreviewWidget.cpp
+    ui/ColorWheelWidget.h
+    ui/ColorWheelWidget.cpp
     ui/SecondaryViewerWindow.h
     ui/SecondaryViewerWindow.cpp
     resources/resources.qrc

@@ -2,5 +2,14 @@
 <RCC version="1.0">
     <qresource prefix="/icons">
         <file alias="lumen_logo_512.png">icons/lumen_logo_512.png</file>
+        <file alias="sidebar/tone.svg">icons/sidebar/tone.svg</file>
+        <file alias="sidebar/color.svg">icons/sidebar/color.svg</file>
+        <file alias="sidebar/hsl.svg">icons/sidebar/hsl.svg</file>
+        <file alias="sidebar/curves.svg">icons/sidebar/curves.svg</file>
+        <file alias="sidebar/histogram.svg">icons/sidebar/histogram.svg</file>
+        <file alias="sidebar/grading.svg">icons/sidebar/grading.svg</file>
+        <file alias="sidebar/mask.svg">icons/sidebar/mask.svg</file>
+        <file alias="sidebar/presets.svg">icons/sidebar/presets.svg</file>
+        <file alias="sidebar/plugins.svg">icons/sidebar/plugins.svg</file>
     </qresource>
 </RCC>

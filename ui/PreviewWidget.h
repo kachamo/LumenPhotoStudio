@@ -37,6 +37,10 @@
 #include <QPointF>
 #include <QWidget>
 
+namespace lps {
+struct LocalAdjustment;
+}
+
 class PreviewWidget : public QWidget
 {
     Q_OBJECT
@@ -88,6 +92,36 @@ public:
     void setColorSamplingActive(bool on);
     bool isColorSamplingActive() const { return m_colorSamplingActive; }
 
+    // ---- Mask overlay ----------------------------------------------------
+    // Shows the active mask as a colored translucent layer over the image,
+    // plus draggable handles for repositioning the mask geometry. The
+    // overlay is UI-only — it is not part of the rendered output and does
+    // not appear in exports.
+    //
+    // Active mask: pointer to the mask currently being edited, or nullptr
+    // for "no mask selected" (overlay hidden). The pointer must remain
+    // valid for the lifetime of the selection — MainWindow refreshes
+    // setActiveMask whenever m_look.localAdjustments is mutated.
+    //
+    // Overlay opacity is in [0, 1]; default 0.35 matches the spec's 35%.
+    // Color defaults to brand-accent #CCFF00.
+    void setActiveMask(const lps::LocalAdjustment* mask);
+    void setShowMaskOverlay(bool on);
+    void setMaskOverlayOpacity(float op01);
+    void setMaskOverlayColor(const QColor& color);
+
+    // View modes for the overlay. "Overlay" and "Off" are fully
+    // implemented; BlackAndWhite/MarchingAnts are placeholders that
+    // currently render the same as Overlay (BlackAndWhite uses a
+    // grayscale-modulated tint instead of a colored one).
+    enum class MaskViewMode : int {
+        Overlay        = 0,
+        BlackAndWhite  = 1,
+        MarchingAnts   = 2,
+        Off            = 3,
+    };
+    void setMaskViewMode(MaskViewMode mode);
+
     QSize sizeHint()        const override { return QSize(640, 480); }
     QSize minimumSizeHint() const override { return QSize(320, 240); }
 
@@ -102,6 +136,14 @@ signals:
     // skin-tone detection, etc. Slots that only need the color can
     // declare `void slot(QColor)`; Qt drops unused trailing args.
     void colorSampled(QColor color, QPoint imagePos);
+
+    // Mask geometry events. dragStarted fires once at handle press
+    // (MainWindow uses it for undo snapshot). geometryChanged fires
+    // on every move; MainWindow rebuilds dependent UI and kicks the
+    // render debounce. Both fire only when an active mask is set and
+    // a handle is grabbed.
+    void maskHandleDragStarted();
+    void maskGeometryChanged();
 
 protected:
     void paintEvent       (QPaintEvent*  event) override;
@@ -165,4 +207,35 @@ private:
     // selection, skin-tone detection). Pure read — no side effects, no
     // render trigger. Spec rule: sampling does NOT trigger render.
     QColor sampleAt(const QPoint& imagePos, bool* valid = nullptr) const;
+
+    // ---- Mask overlay state -------------------------------------------------
+    // Pointer to active mask (NOT owned — MainWindow owns m_look). Set
+    // to nullptr when no mask is selected. The overlay paint path
+    // checks this for null first and bails early.
+    const lps::LocalAdjustment* m_activeMask = nullptr;
+
+    bool          m_showMaskOverlay   = true;
+    float         m_maskOverlayAlpha  = 0.35f;
+    QColor        m_maskOverlayColor  = QColor(0xCC, 0xFF, 0x00);
+    MaskViewMode  m_maskViewMode      = MaskViewMode::Overlay;
+
+    // Cached overlay image at source image dimensions. Rebuilt when the
+    // active mask changes or its geometry changes. Painted via the same
+    // image→widget transform as the photo, so zoom/pan are free.
+    QImage m_maskOverlayCache;
+    bool   m_maskOverlayCacheDirty = true;
+
+    void rebuildMaskOverlayCache();
+    void invalidateMaskOverlayCache();
+    void paintMaskOverlay(QPainter& p, const QRectF& imageRectInWidget);
+    void paintMaskHandles(QPainter& p);
+
+    // Hit-test handles. Returns the index of the grabbed handle, or -1.
+    // Handle indices are mask-type specific (see implementation).
+    int  hitTestHandle(const QPointF& widgetPos) const;
+    void applyHandleDrag(int handleIndex, const QPointF& widgetPos);
+
+    // Drag state for handle interaction.
+    int     m_grabbedHandle = -1;
+    QPointF m_handleDragOffsetImageCoords;   // for "move whole gradient" handle
 };

@@ -19,13 +19,19 @@
 #pragma once
 
 #include "core/Look.h"
+#include "local/LocalAdjustmentEngine.h"
 
 #include <QImage>
 #include <QMainWindow>
+#include <QVBoxLayout>
 
 QT_BEGIN_NAMESPACE
 class QAction;
+class QCheckBox;
 class QLabel;
+class QLineEdit;
+class QListWidget;
+class QListWidgetItem;
 class QMenu;
 class QPushButton;
 class QSlider;
@@ -33,9 +39,11 @@ class QStackedLayout;
 class QTimer;
 class QToolButton;
 class QWidget;
+class QComboBox;
 QT_END_NAMESPACE
 
 class CurveEditorWidget;
+class ColorWheelWidget;
 class HistogramWidget;
 class EmptyStateOverlay;
 class PreviewWidget;
@@ -268,6 +276,22 @@ private:
     QLabel*   m_lutNameLabel     = nullptr;
     QPushButton* m_lutLoadBtn    = nullptr;
     QPushButton* m_lutClearBtn   = nullptr;
+    QCheckBox*   m_lutEnabledCheck = nullptr;   // master on/off; preserves opacity
+
+    // ---- Advanced grading (DaVinci-style) — V1 placeholders -----------------
+    // Sliders write to m_look.grading.{lift,gamma,gain,offset}. Engine
+    // math is a follow-up; values persist through save/load and undo/redo.
+    QSlider* m_liftSlider   = nullptr;  QLabel* m_liftValue   = nullptr;
+    QSlider* m_gammaSlider  = nullptr;  QLabel* m_gammaValue  = nullptr;
+    QSlider* m_gainSlider   = nullptr;  QLabel* m_gainValue   = nullptr;
+    QSlider* m_offsetSlider = nullptr;  QLabel* m_offsetValue = nullptr;
+
+    // ---- Filmic look controls — V1 placeholders ----------------------------
+    QSlider* m_filmicContrastSlider   = nullptr; QLabel* m_filmicContrastValue   = nullptr;
+    QSlider* m_highlightRolloffSlider = nullptr; QLabel* m_highlightRolloffValue = nullptr;
+    QSlider* m_shadowLiftSlider       = nullptr; QLabel* m_shadowLiftValue       = nullptr;
+    QSlider* m_fadeBlacksSlider       = nullptr; QLabel* m_fadeBlacksValue       = nullptr;
+    QSlider* m_colorSeparationSlider  = nullptr; QLabel* m_colorSeparationValue  = nullptr;
 
     // Most-recently-loaded preset filename (display only). Updated by
     // onLoadPreset on success; reset to "(no preset loaded)" on Reset Edits
@@ -284,12 +308,14 @@ private:
     // refreshGradingWidgets iterate generically.
     static constexpr int kGradingWheelCount = 4;
     struct GradingWheelWidgets {
-        QSlider* hue        = nullptr;
-        QLabel*  hueValue   = nullptr;
-        QSlider* sat        = nullptr;
-        QLabel*  satValue   = nullptr;
+        ColorWheelWidget* wheel = nullptr;
+        QLabel*  hueValue   = nullptr;   // numeric readout near the wheel
+        QLabel*  satValue   = nullptr;   // numeric readout near the wheel
         QSlider* str        = nullptr;
         QLabel*  strValue   = nullptr;
+        QSlider* lum        = nullptr;
+        QLabel*  lumValue   = nullptr;
+        QPushButton* resetBtn = nullptr;
         QWidget* slidersBox = nullptr;   // collapsible body (hidden when not expanded)
         QToolButton* header = nullptr;   // expand/collapse header
         bool     expanded   = true;
@@ -314,6 +340,105 @@ private:
     // Refresh the LUT widgets from m_look.grading. Called by applyLookToUi
     // after any non-user-initiated mutation (undo/redo, preset load).
     void refreshLutWidgets();
+
+    // ---- Local masks ---------------------------------------------------------
+    // List of masks (one row per LocalAdjustment), with checkbox per row
+    // for enabled-state toggle. Selecting a row drives the mask-detail
+    // sliders below the list. Add/Delete buttons and an inline status
+    // label round out the section.
+    QListWidget* m_maskList            = nullptr;
+    QPushButton* m_maskAddLinearBtn    = nullptr;
+    QPushButton* m_maskAddRadialBtn    = nullptr;
+    QPushButton* m_maskAddBrushBtn     = nullptr;
+    QPushButton* m_maskDeleteBtn       = nullptr;
+    QLabel*      m_maskStatusLabel     = nullptr;
+
+    // Per-mask sliders. These edit the currently-selected mask's adjustment
+    // values. Kept enabled only when a mask is selected.
+    QSlider* m_maskExposureSlider     = nullptr;  QLabel* m_maskExposureValue    = nullptr;
+    QSlider* m_maskBrightnessSlider   = nullptr;  QLabel* m_maskBrightnessValue  = nullptr;
+    QSlider* m_maskContrastSlider     = nullptr;  QLabel* m_maskContrastValue    = nullptr;
+    QSlider* m_maskSaturationSlider   = nullptr;  QLabel* m_maskSaturationValue  = nullptr;
+    QSlider* m_maskTemperatureSlider  = nullptr;  QLabel* m_maskTemperatureValue = nullptr;
+    QSlider* m_maskTintSlider         = nullptr;  QLabel* m_maskTintValue        = nullptr;
+
+    // Geometry / structural mask controls. Distinct from adjustment sliders:
+    // these change WHERE the mask hits, not what it does.
+    QLineEdit*   m_maskNameEdit       = nullptr;
+    QCheckBox*   m_maskInvertCheck    = nullptr;
+    QSlider*     m_maskFeatherSlider  = nullptr; QLabel* m_maskFeatherValue = nullptr;
+    QSlider*     m_maskDensitySlider  = nullptr; QLabel* m_maskDensityValue = nullptr;
+    QSlider*     m_maskFlowSlider     = nullptr; QLabel* m_maskFlowValue    = nullptr;
+    QPushButton* m_maskResetGeoBtn    = nullptr;
+
+    // Mask overlay UI controls. Drive PreviewWidget's overlay state.
+    QCheckBox*   m_maskShowOverlayCheck   = nullptr;
+    QSlider*     m_maskOverlayOpacitySlider = nullptr;
+    QLabel*      m_maskOverlayOpacityValue  = nullptr;
+    QComboBox*   m_maskViewModeCombo      = nullptr;
+
+    // Index of the currently-selected mask in m_look.localAdjustments,
+    // or -1 if no mask is selected. After undo/redo the index may need
+    // clamping if the count shrank — refreshMaskWidgets handles this.
+    int m_selectedMaskIndex = -1;
+
+    // Slots for the masks section.
+    void onAddLinearMask();
+    void onAddRadialMask();
+    void onAddBrushMask();
+    void onDeleteSelectedMask();
+    void onMaskListSelectionChanged();
+    void onMaskItemChanged(QListWidgetItem* item);   // checkbox toggle
+    void onMaskGeometryChangedFromPreview();         // from PreviewWidget signal
+    void onResetMaskGeometry();                      // reset selected mask's geometry
+
+    // Push the active-mask pointer to PreviewWidget. Called from
+    // refreshMaskWidgets so the preview always reflects the selected
+    // mask without an extra round trip.
+    void syncActiveMaskToPreview();
+
+    // Rebuild m_maskList rows from m_look.localAdjustments and refresh
+    // the per-mask sliders from the currently-selected entry. Signal-
+    // blocked internally so it doesn't kick the debounce.
+    void refreshMaskWidgets();
+
+    // Helper: append a new mask, take an undo snapshot, select it.
+    void addMaskCommon(lps::LocalAdjustment&& mask, const QString& kind);
+
+    // ---- Adjustment layers ---------------------------------------------------
+    // Stackable layers UI. Each list row maps to one entry in
+    // m_look.adjustmentLayers, with a checkbox for enabled-state and
+    // selection driving the per-layer Opacity slider + Blend Mode combo.
+    //
+    // Layer rendering is V1-placeholder: data round-trips through save/
+    // load and undo/redo, but the pipeline doesn't yet apply layer Looks
+    // on top of the base. The follow-up step adds the compositing pass.
+    QListWidget* m_layerList            = nullptr;
+    QPushButton* m_layerAddBtn          = nullptr;
+    QPushButton* m_layerDuplicateBtn    = nullptr;
+    QPushButton* m_layerDeleteBtn       = nullptr;
+    QSlider*     m_layerOpacitySlider   = nullptr;
+    QLabel*      m_layerOpacityValue    = nullptr;
+    QComboBox*   m_layerBlendModeCombo  = nullptr;
+    QLabel*      m_layerStatusLabel     = nullptr;
+
+    // Index of currently-selected layer in m_look.adjustmentLayers, or
+    // -1 if no layer is selected. Clamped by refreshLayerWidgets after
+    // any list-size change (undo/redo, delete).
+    int m_selectedLayerIndex = -1;
+
+    // Slots for the layers section.
+    void onAddLayer();
+    void onDuplicateLayer();
+    void onDeleteSelectedLayer();
+    void onLayerListSelectionChanged();
+    void onLayerItemChanged(QListWidgetItem* item);
+    void onLayerOpacityChanged(int v);
+    void onLayerBlendModeChanged(int comboIndex);
+
+    // Rebuild m_layerList from m_look.adjustmentLayers and refresh the
+    // per-layer controls. Signal-blocked internally.
+    void refreshLayerWidgets();
 
     // ---- HSL (selective color) controls -------------------------------------
     // Lightroom-style: eight channel-selector buttons, three sliders that
@@ -534,19 +659,4 @@ private:
     // Underlying file I/O. Return true on success.
     bool saveProjectToPath(const QString& path);
     bool loadProjectFromPath(const QString& path);
-
-    // Restore the previous Look from the undo stack. Current state moves
-    // to the redo stack. Updates the UI and re-renders.
-    void undo();
-
-    // Restore the next Look from the redo stack. Current state moves
-    // to the undo stack. Updates the UI and re-renders.
-    void redo();
-
-    // Push every UI control's visible state from m_look. Used after undo/redo
-    // (and, prospectively, after preset load). Signals are blocked throughout
-    // so these programmatic setValue()/setChecked() calls don't kick the
-    // debounce or fabricate undo entries. At the end, a single debounce kick
-    // triggers one re-render.
-    void applyLookToUi();
 };

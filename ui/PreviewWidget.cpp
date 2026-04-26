@@ -3,6 +3,9 @@
 // ==============================================================================
 #include "PreviewWidget.h"
 
+#include "core/Look.h"
+#include "local/MaskGeometry.h"
+
 #include <QFontMetrics>
 #include <QMouseEvent>
 #include <QPaintEvent>
@@ -66,7 +69,9 @@ void PreviewWidget::setOriginalImage(const QImage& image)
 void PreviewWidget::setEditedImage(const QImage& image)
 {
     if (m_editedImage.cacheKey() == image.cacheKey()) return;
+    const bool sizeChanged = m_editedImage.size() != image.size();
     m_editedImage = image;
+    if (sizeChanged) invalidateMaskOverlayCache();
     update();
 }
 
@@ -310,6 +315,18 @@ void PreviewWidget::paintEvent(QPaintEvent* /*event*/)
     const QRectF target = imageRectInWidget();
     p.drawImage(target, img, QRectF(img.rect()));
 
+    // Mask overlay + handles. Painted on top of the image but in image-
+    // local widget coordinates, so they scale and pan with the photo.
+    // The overlay layer is independent of the image and does not affect
+    // the photo pixels — render output / export is unchanged.
+    if (m_activeMask && m_showMaskOverlay
+        && m_maskViewMode != MaskViewMode::Off) {
+        paintMaskOverlay(p, target);
+    }
+    if (m_activeMask) {
+        paintMaskHandles(p);
+    }
+
     // Zoom-label chip. Top-left corner, small rounded rect with text.
     QFont chipFont = font();
     chipFont.setPointSizeF(font().pointSizeF() * 0.85);
@@ -432,17 +449,36 @@ void PreviewWidget::mousePressEvent(QMouseEvent* event)
         return;
     }
 
+    // Mask handle interception. When an active mask is set and the user
+    // left-clicks on one of its handles, start a drag. This wins over
+    // color sampling because the visible handles are an explicit user
+    // choice; clicking ON one is unambiguous.
+    if (m_activeMask && event->button() == Qt::LeftButton &&
+        event->modifiers() == Qt::NoModifier) {
+        const int hit = hitTestHandle(event->position());
+        if (hit >= 0) {
+            m_grabbedHandle = hit;
+            // Capture the offset from the click point to the geometry's
+            // anchor for "move whole gradient" so the gradient doesn't
+            // jump on grab. Store in image-normalized coords.
+            const QPointF imgF = widgetToImage(event->position());
+            const QImage& img = displayImage();
+            if (!img.isNull()) {
+                const QPointF normClick(imgF.x() / img.width(),
+                                         imgF.y() / img.height());
+                m_handleDragOffsetImageCoords = normClick;
+            }
+            emit maskHandleDragStarted();
+            event->accept();
+            return;
+        }
+    }
+
     // Color-sampling intercept. Only fires for plain left-click (modifiers
     // empty); modifier+left combinations are reserved for future tools or
     // for the pan path above.
     if (m_colorSamplingActive && event->button() == Qt::LeftButton &&
         event->modifiers() == Qt::NoModifier) {
-        // Map widget coordinates → image coordinates via the existing
-        // pan/zoom transform. The result may be outside image bounds (if
-        // the user clicked the letterbox area around a fit-mode image);
-        // sampleAt returns valid=false in that case and we silently
-        // ignore — spec rule: "If click occurs outside image bounds:
-        // ignore click safely."
         const QPointF imageF = widgetToImage(event->position());
         const QPoint imagePos(static_cast<int>(std::floor(imageF.x())),
                               static_cast<int>(std::floor(imageF.y())));
@@ -451,9 +487,6 @@ void PreviewWidget::mousePressEvent(QMouseEvent* event)
         if (valid) {
             emit colorSampled(c, imagePos);
         }
-        // We accept the click either way — a click in letterbox area
-        // shouldn't fall through to other handlers (e.g. the parent's
-        // context menu handler, though right-click is what triggers that).
         event->accept();
         return;
     }
@@ -472,6 +505,17 @@ void PreviewWidget::mouseMoveEvent(QMouseEvent* event)
         event->accept();
         return;
     }
+
+    // Handle drag in progress.
+    if (m_grabbedHandle >= 0 && m_activeMask) {
+        applyHandleDrag(m_grabbedHandle, event->position());
+        invalidateMaskOverlayCache();
+        update();
+        emit maskGeometryChanged();
+        event->accept();
+        return;
+    }
+
     QWidget::mouseMoveEvent(event);
 }
 
@@ -479,12 +523,13 @@ void PreviewWidget::mouseReleaseEvent(QMouseEvent* event)
 {
     if (event->button() == m_panButton) {
         m_panButton = Qt::NoButton;
-        // Restore the right cursor: crosshair if sampling is still active,
-        // platform default otherwise. Without this, pan-release while in
-        // sampling mode would drop us back to the default cursor and the
-        // user would lose the visual cue.
         if (m_colorSamplingActive) setCursor(Qt::CrossCursor);
         else                       unsetCursor();
+        event->accept();
+        return;
+    }
+    if (m_grabbedHandle >= 0 && event->button() == Qt::LeftButton) {
+        m_grabbedHandle = -1;
         event->accept();
         return;
     }
@@ -516,4 +561,387 @@ void PreviewWidget::mouseDoubleClickEvent(QMouseEvent* event)
     }
     update();
     event->accept();
+}
+
+// ==============================================================================
+// Mask overlay
+//
+// The active mask is rendered as a colored translucent layer over the
+// image. Per-pixel mask weight (from local/MaskGeometry.h, the same math
+// the engine uses) is converted to an alpha multiplier on the overlay
+// color. Result: areas the mask affects are visibly tinted; areas it
+// doesn't are clear.
+//
+// We cache the alpha mask at source-image dimensions so zoom/pan reuse
+// the cache — Qt scales it during paint via the same image→widget
+// transform as the photo. The cache invalidates when the active mask
+// changes, geometry changes (handle drag, slider edit), or image size
+// changes (load / rotation / flip).
+//
+// Overlay is UI-only — never written into m_editedImage, never seen by
+// export. The engine continues to render the actual mask effect into
+// the photo via LocalAdjustmentEngine; the overlay just shows users
+// where the mask hits.
+// ==============================================================================
+void PreviewWidget::setActiveMask(const lps::LocalAdjustment* mask)
+{
+    // Always invalidate the cache. Callers may pass the same pointer to
+    // signal "the mask's data changed" (e.g. after a slider edit) — we
+    // can't tell from the pointer alone whether the underlying data is
+    // stale, so a cache rebuild on every call is the safe default. The
+    // rebuild itself early-outs on null images / null masks, so the
+    // cost when "nothing meaningful changed" is tiny.
+    m_activeMask = mask;
+    invalidateMaskOverlayCache();
+    update();
+}
+
+void PreviewWidget::setShowMaskOverlay(bool on)
+{
+    if (m_showMaskOverlay == on) return;
+    m_showMaskOverlay = on;
+    update();
+}
+
+void PreviewWidget::setMaskOverlayOpacity(float op01)
+{
+    op01 = std::clamp(op01, 0.0f, 1.0f);
+    if (std::fabs(m_maskOverlayAlpha - op01) < 1e-3f) return;
+    m_maskOverlayAlpha = op01;
+    update();
+}
+
+void PreviewWidget::setMaskOverlayColor(const QColor& color)
+{
+    if (m_maskOverlayColor == color) return;
+    m_maskOverlayColor = color;
+    update();
+}
+
+void PreviewWidget::setMaskViewMode(MaskViewMode mode)
+{
+    if (m_maskViewMode == mode) return;
+    m_maskViewMode = mode;
+    update();
+}
+
+void PreviewWidget::invalidateMaskOverlayCache()
+{
+    m_maskOverlayCacheDirty = true;
+}
+
+// Build the overlay alpha image at source-image dimensions. Each pixel's
+// alpha is set proportional to the mask weight at that image coordinate.
+// Cost: ~width × height float ops + a few per-pixel arithmetic ops. At
+// 2-megapixel preview, runs in tens of ms — acceptable on geometry-change
+// events (which are rate-limited by mouse drag throttling anyway).
+void PreviewWidget::rebuildMaskOverlayCache()
+{
+    m_maskOverlayCacheDirty = false;
+    const QImage& src = displayImage();
+    if (src.isNull() || !m_activeMask) {
+        m_maskOverlayCache = QImage();
+        return;
+    }
+
+    const int W = src.width();
+    const int H = src.height();
+    if (W <= 0 || H <= 0) {
+        m_maskOverlayCache = QImage();
+        return;
+    }
+
+    QImage img(W, H, QImage::Format_ARGB32_Premultiplied);
+    img.fill(Qt::transparent);
+
+    const float aspect = static_cast<float>(W) / static_cast<float>(H);
+    const double invW = 1.0 / static_cast<double>(W);
+    const double invH = 1.0 / static_cast<double>(H);
+
+    const lps::LocalAdjustment& mask = *m_activeMask;
+    const float density = std::clamp(mask.density, 0.0f, 1.0f);
+    const bool  invert  = mask.invert;
+    const bool  bw      = (m_maskViewMode == MaskViewMode::BlackAndWhite);
+
+    // Tint color components, premultiplied with full alpha at the end
+    // (per-pixel alpha is the actual modulation).
+    int tr = m_maskOverlayColor.red();
+    int tg = m_maskOverlayColor.green();
+    int tb = m_maskOverlayColor.blue();
+    if (bw) { tr = 255; tg = 255; tb = 255; }   // grayscale mode
+
+    for (int y = 0; y < H; ++y) {
+        QRgb* row = reinterpret_cast<QRgb*>(img.scanLine(y));
+        const double v = (static_cast<double>(y) + 0.5) * invH;
+        for (int x = 0; x < W; ++x) {
+            const double u = (static_cast<double>(x) + 0.5) * invW;
+            float w = lps::maskWeight(QPointF(u, v), mask, aspect);
+            if (invert) w = 1.0f - w;
+            w *= density;
+            if (w <= 0.005f) {
+                row[x] = 0;
+                continue;
+            }
+            // Premultiplied: rgb scaled by alpha. Alpha comes from the
+            // mask weight directly (range [0, 255]).
+            const int a = static_cast<int>(w * 255.0f + 0.5f);
+            const int rr = (tr * a) / 255;
+            const int gg = (tg * a) / 255;
+            const int bb = (tb * a) / 255;
+            row[x] = qRgba(rr, gg, bb, a);
+        }
+    }
+    m_maskOverlayCache = std::move(img);
+}
+
+void PreviewWidget::paintMaskOverlay(QPainter& p, const QRectF& target)
+{
+    if (m_maskOverlayCacheDirty) rebuildMaskOverlayCache();
+    if (m_maskOverlayCache.isNull()) return;
+
+    p.save();
+    p.setOpacity(m_maskOverlayAlpha);
+    p.setRenderHint(QPainter::SmoothPixmapTransform, true);
+    p.drawImage(target, m_maskOverlayCache, QRectF(m_maskOverlayCache.rect()));
+    p.restore();
+}
+
+// Handle layout per mask type:
+//   Linear:  0=start, 1=end, 2=midpoint (move-whole-gradient)
+//   Radial:  0=center, 1=radius edge, 2=feather edge
+//   Brush:   no handles in V1 (placeholder)
+namespace {
+
+// Convert a mask's normalized coord to image-pixel coord.
+inline QPointF normToImagePx(const QPointF& norm, const QImage& img)
+{
+    return QPointF(norm.x() * img.width(), norm.y() * img.height());
+}
+
+} // namespace
+
+void PreviewWidget::paintMaskHandles(QPainter& p)
+{
+    const QImage& img = displayImage();
+    if (img.isNull() || !m_activeMask) return;
+
+    const lps::LocalAdjustment& mask = *m_activeMask;
+    p.save();
+    p.setRenderHint(QPainter::Antialiasing, true);
+
+    const QColor accent(0xCC, 0xFF, 0x00);
+    const QColor shadow(0, 0, 0, 180);
+    const float handleR = 6.0f;
+
+    auto drawHandle = [&](const QPointF& widgetPos) {
+        p.setPen(QPen(shadow, 2.0));
+        p.setBrush(accent);
+        p.drawEllipse(widgetPos, handleR, handleR);
+    };
+
+    switch (mask.type) {
+    case lps::MaskType::LinearGradient: {
+        const QPointF s = imageToWidget(normToImagePx(mask.startPoint, img));
+        const QPointF e = imageToWidget(normToImagePx(mask.endPoint, img));
+
+        // Connecting line from start to end. Drawn first so handles
+        // overlay it.
+        p.setPen(QPen(QColor(255, 255, 255, 200), 1.5,
+                      Qt::DashLine, Qt::FlatCap));
+        p.setBrush(Qt::NoBrush);
+        p.drawLine(s, e);
+
+        // Perpendicular guide lines at start and end (the gradient
+        // boundaries). Length proportional to viewport extent so they
+        // remain visible at any zoom.
+        const QPointF dir = e - s;
+        const double len = std::hypot(dir.x(), dir.y());
+        if (len > 1e-3) {
+            const QPointF perp(-dir.y() / len, dir.x() / len);
+            const double half = std::min<double>(width(), height()) * 0.4;
+            p.setPen(QPen(QColor(255, 255, 255, 160), 1.0, Qt::SolidLine));
+            p.drawLine(s + perp * half, s - perp * half);
+            p.setPen(QPen(QColor(255, 255, 255, 220), 1.5, Qt::SolidLine));
+            p.drawLine(e + perp * half, e - perp * half);
+        }
+
+        drawHandle(s);
+        drawHandle(e);
+        // Midpoint handle for "move whole gradient" — drawn slightly
+        // smaller so it's distinct from the endpoints.
+        p.setPen(QPen(shadow, 2.0));
+        p.setBrush(QColor(255, 255, 255));
+        p.drawEllipse((s + e) * 0.5, handleR * 0.7, handleR * 0.7);
+        break;
+    }
+    case lps::MaskType::RadialGradient: {
+        const QPointF c = imageToWidget(normToImagePx(mask.center, img));
+        // Radius is normalized fraction of the smaller image edge in
+        // image space. To draw on screen, convert to widget coords.
+        // We pick a representative direction (right) and use the
+        // distance from center to that point as the on-screen radius.
+        const float aspect = static_cast<float>(img.width()) /
+                              static_cast<float>(img.height());
+        // Radial radius is multiplied by aspect ratio handling in the
+        // mask weight; for the handle we'll use the unscaled normalized
+        // radius along the X-axis as the on-screen circle's reference,
+        // matching what the user sees in the overlay.
+        Q_UNUSED(aspect);
+        const QPointF edgeImage = normToImagePx(
+            mask.center + QPointF(mask.radius, 0.0), img);
+        const QPointF edgeW = imageToWidget(edgeImage);
+        const double r = std::hypot(edgeW.x() - c.x(), edgeW.y() - c.y());
+
+        // Outer circle (mask boundary).
+        p.setPen(QPen(QColor(255, 255, 255, 220), 1.5, Qt::SolidLine));
+        p.setBrush(Qt::NoBrush);
+        p.drawEllipse(c, r, r);
+
+        // Inner circle (full-strength region — radius * (1 - feather)).
+        const double rInner = r * std::max(0.0,
+            static_cast<double>(1.0 - std::clamp(mask.feather, 0.0f, 1.0f)));
+        if (rInner > 1.0) {
+            p.setPen(QPen(QColor(255, 255, 255, 120), 1.0, Qt::DashLine));
+            p.drawEllipse(c, rInner, rInner);
+        }
+
+        drawHandle(c);
+        // Radius handle at "right" edge.
+        drawHandle(edgeW);
+        // Feather handle on the inner circle, also at the right.
+        if (rInner > 1.0) {
+            p.setPen(QPen(shadow, 2.0));
+            p.setBrush(QColor(255, 255, 255));
+            p.drawEllipse(QPointF(c.x() + rInner, c.y()),
+                          handleR * 0.7, handleR * 0.7);
+        }
+        break;
+    }
+    case lps::MaskType::Brush: {
+        // V1 placeholder: a small circle indicator at the brush "anchor"
+        // (center if no stamps). Brush painting itself isn't implemented.
+        const QPointF c = imageToWidget(normToImagePx(QPointF(0.5, 0.5), img));
+        p.setPen(QPen(QColor(255, 255, 255, 180), 1.5, Qt::DashLine));
+        p.setBrush(Qt::NoBrush);
+        p.drawEllipse(c, 24.0, 24.0);
+        break;
+    }
+    }
+
+    p.restore();
+}
+
+// Hit-test handles at the given widget position. Returns the handle
+// index (mask-type specific) or -1 for "no handle there." Hit radius
+// is generous (12 widget px) for easy grabbing.
+int PreviewWidget::hitTestHandle(const QPointF& widgetPos) const
+{
+    if (!m_activeMask) return -1;
+    const QImage& img = displayImage();
+    if (img.isNull()) return -1;
+
+    const lps::LocalAdjustment& mask = *m_activeMask;
+    const double hitR = 12.0;
+
+    auto hit = [&](const QPointF& q) {
+        return std::hypot(widgetPos.x() - q.x(), widgetPos.y() - q.y()) <= hitR;
+    };
+
+    switch (mask.type) {
+    case lps::MaskType::LinearGradient: {
+        const QPointF s = imageToWidget(normToImagePx(mask.startPoint, img));
+        const QPointF e = imageToWidget(normToImagePx(mask.endPoint, img));
+        if (hit(s)) return 0;
+        if (hit(e)) return 1;
+        if (hit((s + e) * 0.5)) return 2;
+        return -1;
+    }
+    case lps::MaskType::RadialGradient: {
+        const QPointF c = imageToWidget(normToImagePx(mask.center, img));
+        const QPointF edge = imageToWidget(
+            normToImagePx(mask.center + QPointF(mask.radius, 0.0), img));
+        const double r = std::hypot(edge.x() - c.x(), edge.y() - c.y());
+        const double rInner = r * std::max(0.0,
+            static_cast<double>(1.0 - std::clamp(mask.feather, 0.0f, 1.0f)));
+        if (hit(c)) return 0;
+        if (hit(edge)) return 1;
+        if (rInner > 1.0 && hit(QPointF(c.x() + rInner, c.y()))) return 2;
+        return -1;
+    }
+    case lps::MaskType::Brush:
+    default:
+        return -1;
+    }
+}
+
+// Apply a handle drag. Updates the mask geometry in place via the
+// non-const cast — m_activeMask is const-typed so external code can't
+// accidentally mutate it, but the widget owns the editing intent here
+// and pushes geometry changes back to MainWindow via the
+// maskGeometryChanged signal (which then refreshes UI / kicks render).
+void PreviewWidget::applyHandleDrag(int handleIndex, const QPointF& widgetPos)
+{
+    if (!m_activeMask) return;
+    const QImage& img = displayImage();
+    if (img.isNull() || img.width() <= 0 || img.height() <= 0) return;
+
+    const QPointF imgPx = widgetToImage(widgetPos);
+    const QPointF norm(imgPx.x() / img.width(), imgPx.y() / img.height());
+
+    // The const_cast is safe here: m_activeMask points into m_look in
+    // MainWindow, which is heap-stable and writable. The const tag on
+    // the member is purely an external-mutation barrier.
+    auto* mask = const_cast<lps::LocalAdjustment*>(m_activeMask);
+
+    switch (mask->type) {
+    case lps::MaskType::LinearGradient:
+        switch (handleIndex) {
+        case 0: mask->startPoint = norm; break;
+        case 1: mask->endPoint   = norm; break;
+        case 2: {
+            // Move whole gradient: translate both start and end by the
+            // delta from current midpoint to the cursor.
+            const QPointF mid = (mask->startPoint + mask->endPoint) * 0.5;
+            const QPointF d   = norm - mid;
+            mask->startPoint += d;
+            mask->endPoint   += d;
+            break;
+        }
+        default: break;
+        }
+        break;
+    case lps::MaskType::RadialGradient:
+        switch (handleIndex) {
+        case 0: mask->center = norm; break;
+        case 1: {
+            // Radius drag — distance from center to cursor in normalized
+            // coords. Floor at a tiny minimum to keep math finite.
+            const double dx = norm.x() - mask->center.x();
+            const double dy = norm.y() - mask->center.y();
+            const double r  = std::sqrt(dx*dx + dy*dy);
+            mask->radius = std::max(1e-3f, static_cast<float>(r));
+            break;
+        }
+        case 2: {
+            // Feather drag — the inner circle handle. Compute current
+            // distance and convert to a feather fraction:
+            //   innerFrac = innerDist / radius
+            //   feather   = 1 - innerFrac
+            const double dx = norm.x() - mask->center.x();
+            const double dy = norm.y() - mask->center.y();
+            const double dist = std::sqrt(dx*dx + dy*dy);
+            if (mask->radius > 1e-4f) {
+                const float innerFrac = std::clamp(
+                    static_cast<float>(dist / mask->radius), 0.0f, 1.0f);
+                mask->feather = 1.0f - innerFrac;
+            }
+            break;
+        }
+        default: break;
+        }
+        break;
+    case lps::MaskType::Brush:
+    default:
+        break;
+    }
 }

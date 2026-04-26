@@ -3,6 +3,7 @@
 // ==============================================================================
 #include "MainWindow.h"
 
+#include "ColorWheelWidget.h"
 #include "CurveEditorWidget.h"
 #include "EmptyStateOverlay.h"
 #include "HistogramWidget.h"
@@ -25,11 +26,17 @@
 #include <QFuture>
 #include <QFutureWatcher>
 #include <QGridLayout>
+#include <QCheckBox>
+#include <QComboBox>
 #include <QHBoxLayout>
+#include <QIcon>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QKeyEvent>
 #include <QLabel>
+#include <QLineEdit>
+#include <QListWidget>
+#include <QListWidgetItem>
 #include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
@@ -226,6 +233,14 @@ void MainWindow::buildUi()
     connect(m_previewLabel, &PreviewWidget::colorSampled,
             this, &MainWindow::onColorSampled);
 
+    // Mask handle drag — start (push undo) and live geometry change
+    // (refresh dependent UI + kick render debounce). Same one-snapshot-
+    // per-drag pattern as sliders.
+    connect(m_previewLabel, &PreviewWidget::maskHandleDragStarted,
+            this, &MainWindow::pushUndoSnapshot);
+    connect(m_previewLabel, &PreviewWidget::maskGeometryChanged,
+            this, &MainWindow::onMaskGeometryChangedFromPreview);
+
     // ---- Controls sidebar (right) -------------------------------------------
     // The sidebar is a QStackedLayout container with two children:
     //   m_sidebarFull — the full controls panel (~320 px wide). Returned by
@@ -259,27 +274,46 @@ void MainWindow::buildUi()
 
         miniLay->addSpacing(8);
 
-        // Section icons (text glyphs in lieu of real icon assets — keeps
-        // the visual language consistent without adding image deps).
-        // Each one re-expands the sidebar; future work could scroll-to
-        // the corresponding section after expanding.
-        const struct { const char* label; const char* tip; } kSections[] = {
-            { "H", "Histogram"     },
-            { "T", "Tone"          },
-            { "C", "Color"         },
-            { "S", "HSL"           },
-            { "K", "Curves"        },
+        // Section icons. SVGs use stroke="currentColor" so a stylesheet
+        // can recolor them via the QToolButton's text color — inactive
+        // #7A7A7A, hover #CCFF00 (the brand accent). Clicking any icon
+        // re-expands the sidebar; future work could scroll-to the
+        // corresponding section after expanding.
+        const struct {
+            const char* iconPath;   // resource path
+            const char* tip;
+        } kSections[] = {
+            { ":/icons/sidebar/histogram.svg", "Histogram" },
+            { ":/icons/sidebar/tone.svg",      "Tone"      },
+            { ":/icons/sidebar/color.svg",     "Color"     },
+            { ":/icons/sidebar/hsl.svg",       "HSL"       },
+            { ":/icons/sidebar/curves.svg",    "Curves"    },
+            { ":/icons/sidebar/grading.svg",   "Color Grading" },
+            { ":/icons/sidebar/mask.svg",      "Masks"     },
+            { ":/icons/sidebar/presets.svg",   "Presets"   },
+            { ":/icons/sidebar/plugins.svg",   "Plugins"   },
         };
+        // Stylesheet recipe: SVGs are loaded as QIcon; the surrounding
+        // QToolButton text color drives currentColor in the rendered
+        // SVG via the icon engine's color binding only when the icon
+        // is rendered with a tint. Since QIcon's default rendering
+        // doesn't apply text color to SVG strokes, we instead style
+        // the button background/border for state feedback. The icon
+        // itself stays its authored color (which is currentColor →
+        // resolved by Qt's SVG renderer to the default text color).
+        const QString miniBtnQss =
+            "QToolButton { background: transparent; border: 1px solid transparent;"
+            "              border-radius: 4px; padding: 2px;"
+            "              color: #7A7A7A; }"
+            "QToolButton:hover { color: #CCFF00; border-color: #2a2a2e; }";
         for (const auto& s : kSections) {
             auto* btn = new QToolButton(m_sidebarMini);
-            btn->setText(QString::fromLatin1(s.label));
+            btn->setIcon(QIcon(QString::fromLatin1(s.iconPath)));
+            btn->setIconSize(QSize(20, 20));
             btn->setToolTip(tr(s.tip));
             btn->setCursor(Qt::PointingHandCursor);
-            btn->setFixedSize(32, 28);
-            btn->setStyleSheet(
-                "QToolButton { color: #9A9AA0; border: 1px solid #3a3a3f;"
-                "              border-radius: 3px; }"
-                "QToolButton:hover { color: #d0d0d4; border-color: #6a6a70; }");
+            btn->setFixedSize(32, 32);
+            btn->setStyleSheet(miniBtnQss);
             connect(btn, &QToolButton::clicked,
                     this, &MainWindow::onToggleSidebar);
             miniLay->addWidget(btn, 0, Qt::AlignHCenter);
@@ -652,6 +686,25 @@ QWidget* MainWindow::buildControlPanel()
         m_debounce->start();
     });
 
+    // LUT Enabled checkbox — master on/off that preserves the opacity
+    // value. When unchecked, ColorGrading::apply skips the LUT branch
+    // (driven by GradingParams::isIdentity's lutActive check).
+    {
+        m_lutEnabledCheck = new QCheckBox(tr("LUT enabled"), panel);
+        m_lutEnabledCheck->setChecked(true);
+        m_lutEnabledCheck->setEnabled(false);   // until a LUT is loaded
+        m_lutEnabledCheck->setCursor(Qt::PointingHandCursor);
+        connect(m_lutEnabledCheck, &QCheckBox::toggled, this, [this](bool on) {
+            if (m_look.grading.lutEnabled == on) return;
+            pushUndoSnapshot();
+            m_look.grading.lutEnabled = on;
+            refreshUndoRedoActions();
+            markDirty();
+            if (m_debounce) m_debounce->start();
+        });
+        col->addWidget(m_lutEnabledCheck);
+    }
+
     // ---- 3-way color grading wheels ----------------------------------------
     // Four wheels (Shadows / Midtones / Highlights / Global) each with
     // hue/saturation/strength. Plus Balance and Blending sliders.
@@ -704,6 +757,140 @@ QWidget* MainWindow::buildControlPanel()
             m_blendingValue->setText(QString::number(v));
             m_debounce->start();
         });
+
+        // ---- Advanced grading (DaVinci-style) — collapsible -----------------
+        // Lift / Gamma / Gain / Offset. V1 placeholders — UI present, data
+        // round-trips, engine math is a follow-up.
+        {
+            auto* advHeader = new QToolButton(panel);
+            advHeader->setText(QString::fromUtf8("▸ ") + tr("Advanced Grading"));
+            advHeader->setToolButtonStyle(Qt::ToolButtonTextOnly);
+            advHeader->setAutoRaise(true);
+            advHeader->setCursor(Qt::PointingHandCursor);
+            advHeader->setStyleSheet(
+                "QToolButton { color: #b0b0b6; text-align: left; padding: 2px 4px; }"
+                "QToolButton:hover { color: #d0d0d4; }");
+            col->addWidget(advHeader);
+
+            auto* advBox = new QWidget(panel);
+            auto* advLay = new QVBoxLayout(advBox);
+            advLay->setContentsMargins(8, 0, 0, 0);
+            advLay->setSpacing(2);
+            advBox->setVisible(false);   // collapsed by default
+
+            connect(advHeader, &QToolButton::clicked, this, [advHeader, advBox]() {
+                const bool wasVisible = advBox->isVisible();
+                advBox->setVisible(!wasVisible);
+                advHeader->setText((!wasVisible ? QString::fromUtf8("▾ ")
+                                                : QString::fromUtf8("▸ "))
+                                   + tr("Advanced Grading"));
+            });
+
+            advLay->addWidget(buildSliderRow(tr("Lift"),
+                                             -100, 100, 0,
+                                             m_liftSlider, m_liftValue));
+            advLay->addWidget(buildSliderRow(tr("Gamma"),
+                                             -100, 100, 0,
+                                             m_gammaSlider, m_gammaValue));
+            advLay->addWidget(buildSliderRow(tr("Gain"),
+                                             -100, 100, 0,
+                                             m_gainSlider, m_gainValue));
+            advLay->addWidget(buildSliderRow(tr("Offset"),
+                                             -100, 100, 0,
+                                             m_offsetSlider, m_offsetValue));
+            col->addWidget(advBox);
+
+            // Wire each — same pattern: undo on press, write on change.
+            auto wireAdv = [this](QSlider* slider, QLabel* lbl,
+                                  float lps::GradingParams::* field) {
+                connect(slider, &QSlider::sliderPressed,
+                        this, &MainWindow::pushUndoSnapshot);
+                connect(slider, &QSlider::valueChanged, this,
+                        [this, lbl, field](int v) {
+                    m_look.grading.*field = static_cast<float>(v);
+                    if (lbl) lbl->setText(QString::number(v));
+                    if (m_debounce) m_debounce->start();
+                });
+            };
+            wireAdv(m_liftSlider,   m_liftValue,   &lps::GradingParams::lift);
+            wireAdv(m_gammaSlider,  m_gammaValue,  &lps::GradingParams::gamma);
+            wireAdv(m_gainSlider,   m_gainValue,   &lps::GradingParams::gain);
+            wireAdv(m_offsetSlider, m_offsetValue, &lps::GradingParams::offset);
+        }
+
+        // ---- Filmic look — collapsible --------------------------------------
+        // Filmic Contrast / Highlight Rolloff / Shadow Lift / Fade Blacks /
+        // Color Separation. V1 placeholders.
+        {
+            auto* filmHeader = new QToolButton(panel);
+            filmHeader->setText(QString::fromUtf8("▸ ") + tr("Filmic Look"));
+            filmHeader->setToolButtonStyle(Qt::ToolButtonTextOnly);
+            filmHeader->setAutoRaise(true);
+            filmHeader->setCursor(Qt::PointingHandCursor);
+            filmHeader->setStyleSheet(
+                "QToolButton { color: #b0b0b6; text-align: left; padding: 2px 4px; }"
+                "QToolButton:hover { color: #d0d0d4; }");
+            col->addWidget(filmHeader);
+
+            auto* filmBox = new QWidget(panel);
+            auto* filmLay = new QVBoxLayout(filmBox);
+            filmLay->setContentsMargins(8, 0, 0, 0);
+            filmLay->setSpacing(2);
+            filmBox->setVisible(false);
+
+            connect(filmHeader, &QToolButton::clicked, this,
+                    [filmHeader, filmBox]() {
+                const bool wasVisible = filmBox->isVisible();
+                filmBox->setVisible(!wasVisible);
+                filmHeader->setText((!wasVisible ? QString::fromUtf8("▾ ")
+                                                 : QString::fromUtf8("▸ "))
+                                    + tr("Filmic Look"));
+            });
+
+            filmLay->addWidget(buildSliderRow(tr("Filmic Contrast"),
+                                              -100, 100, 0,
+                                              m_filmicContrastSlider,
+                                              m_filmicContrastValue));
+            filmLay->addWidget(buildSliderRow(tr("Highlight Rolloff"),
+                                              -100, 100, 0,
+                                              m_highlightRolloffSlider,
+                                              m_highlightRolloffValue));
+            filmLay->addWidget(buildSliderRow(tr("Shadow Lift"),
+                                              -100, 100, 0,
+                                              m_shadowLiftSlider,
+                                              m_shadowLiftValue));
+            filmLay->addWidget(buildSliderRow(tr("Fade Blacks"),
+                                              -100, 100, 0,
+                                              m_fadeBlacksSlider,
+                                              m_fadeBlacksValue));
+            filmLay->addWidget(buildSliderRow(tr("Color Separation"),
+                                              -100, 100, 0,
+                                              m_colorSeparationSlider,
+                                              m_colorSeparationValue));
+            col->addWidget(filmBox);
+
+            auto wireFilm = [this](QSlider* slider, QLabel* lbl,
+                                   float lps::GradingParams::* field) {
+                connect(slider, &QSlider::sliderPressed,
+                        this, &MainWindow::pushUndoSnapshot);
+                connect(slider, &QSlider::valueChanged, this,
+                        [this, lbl, field](int v) {
+                    m_look.grading.*field = static_cast<float>(v);
+                    if (lbl) lbl->setText(QString::number(v));
+                    if (m_debounce) m_debounce->start();
+                });
+            };
+            wireFilm(m_filmicContrastSlider,   m_filmicContrastValue,
+                     &lps::GradingParams::filmicContrast);
+            wireFilm(m_highlightRolloffSlider, m_highlightRolloffValue,
+                     &lps::GradingParams::highlightRolloff);
+            wireFilm(m_shadowLiftSlider,       m_shadowLiftValue,
+                     &lps::GradingParams::shadowLift);
+            wireFilm(m_fadeBlacksSlider,       m_fadeBlacksValue,
+                     &lps::GradingParams::fadeBlacks);
+            wireFilm(m_colorSeparationSlider,  m_colorSeparationValue,
+                     &lps::GradingParams::colorSeparation);
+        }
     }
 
     // ---- Section header: PRESETS ------------------------------------------
@@ -743,6 +930,389 @@ QWidget* MainWindow::buildControlPanel()
 
     // Initialize LUT widgets from the (default-empty) Look.
     refreshLutWidgets();
+
+    // ---- Section header: MASKS --------------------------------------------
+    // Lightroom-style local adjustments: linear gradient, radial gradient,
+    // and a brush placeholder. Each mask has six adjustment sliders that
+    // operate only where the mask weight > 0 (LocalAdjustmentEngine).
+    //
+    // Layout: three "Add" buttons → list of masks (with per-row checkbox)
+    //       → delete button → six sliders for the selected mask.
+    {
+        auto* maskHeader = new QLabel(tr("MASKS"), panel);
+        maskHeader->setFont(hf);
+        maskHeader->setStyleSheet("color: #9A9AA0; padding-top: 4px;");
+        col->addWidget(maskHeader);
+
+        // Add-mask button row.
+        auto* addRow = new QHBoxLayout();
+        addRow->setContentsMargins(0, 0, 0, 0);
+        addRow->setSpacing(4);
+        m_maskAddLinearBtn = new QPushButton(tr("+ Linear"), panel);
+        m_maskAddLinearBtn->setCursor(Qt::PointingHandCursor);
+        m_maskAddLinearBtn->setToolTip(tr("Add a linear gradient mask"));
+        connect(m_maskAddLinearBtn, &QPushButton::clicked,
+                this, &MainWindow::onAddLinearMask);
+        addRow->addWidget(m_maskAddLinearBtn);
+
+        m_maskAddRadialBtn = new QPushButton(tr("+ Radial"), panel);
+        m_maskAddRadialBtn->setCursor(Qt::PointingHandCursor);
+        m_maskAddRadialBtn->setToolTip(tr("Add a radial gradient mask"));
+        connect(m_maskAddRadialBtn, &QPushButton::clicked,
+                this, &MainWindow::onAddRadialMask);
+        addRow->addWidget(m_maskAddRadialBtn);
+
+        m_maskAddBrushBtn = new QPushButton(tr("+ Brush"), panel);
+        m_maskAddBrushBtn->setCursor(Qt::PointingHandCursor);
+        m_maskAddBrushBtn->setToolTip(tr("Add a brush mask (placeholder)"));
+        connect(m_maskAddBrushBtn, &QPushButton::clicked,
+                this, &MainWindow::onAddBrushMask);
+        addRow->addWidget(m_maskAddBrushBtn);
+        col->addLayout(addRow);
+
+        // Mask list. Per-row checkbox via Qt::ItemIsUserCheckable. Selection
+        // drives which mask the sliders below edit. List takes a moderate
+        // fixed height to keep the rest of the panel reachable.
+        m_maskList = new QListWidget(panel);
+        m_maskList->setSelectionMode(QAbstractItemView::SingleSelection);
+        m_maskList->setMinimumHeight(80);
+        m_maskList->setMaximumHeight(140);
+        m_maskList->setStyleSheet(
+            "QListWidget { background-color: #1c1c1f; "
+            "              border: 1px solid #2a2a2e; }");
+        connect(m_maskList, &QListWidget::itemSelectionChanged,
+                this, &MainWindow::onMaskListSelectionChanged);
+        connect(m_maskList, &QListWidget::itemChanged,
+                this, &MainWindow::onMaskItemChanged);
+        col->addWidget(m_maskList);
+
+        // Delete + status row.
+        auto* delRow = new QHBoxLayout();
+        delRow->setContentsMargins(0, 0, 0, 0);
+        m_maskDeleteBtn = new QPushButton(tr("Delete"), panel);
+        m_maskDeleteBtn->setCursor(Qt::PointingHandCursor);
+        m_maskDeleteBtn->setEnabled(false);
+        connect(m_maskDeleteBtn, &QPushButton::clicked,
+                this, &MainWindow::onDeleteSelectedMask);
+        delRow->addWidget(m_maskDeleteBtn);
+
+        m_maskStatusLabel = new QLabel(tr("No mask selected"), panel);
+        m_maskStatusLabel->setStyleSheet("color: #8a8a90; font-style: italic;");
+        delRow->addWidget(m_maskStatusLabel, /*stretch=*/1);
+        col->addLayout(delRow);
+
+        // Per-mask sliders. Same six fields as in LocalAdjustment. Disabled
+        // when no mask is selected.
+        col->addWidget(buildSliderRow(tr("Exposure"),
+                                      -500, +500, 0,
+                                      m_maskExposureSlider, m_maskExposureValue));
+        col->addWidget(buildSliderRow(tr("Brightness"),
+                                      -100, +100, 0,
+                                      m_maskBrightnessSlider, m_maskBrightnessValue));
+        col->addWidget(buildSliderRow(tr("Contrast"),
+                                      -100, +100, 0,
+                                      m_maskContrastSlider, m_maskContrastValue));
+        col->addWidget(buildSliderRow(tr("Saturation"),
+                                      -100, +100, 0,
+                                      m_maskSaturationSlider, m_maskSaturationValue));
+        col->addWidget(buildSliderRow(tr("Temperature"),
+                                      -100, +100, 0,
+                                      m_maskTemperatureSlider, m_maskTemperatureValue));
+        col->addWidget(buildSliderRow(tr("Tint"),
+                                      -100, +100, 0,
+                                      m_maskTintSlider, m_maskTintValue));
+
+        // Wire mask sliders. Each slider:
+        //  - sliderPressed → pushUndoSnapshot (one snapshot per drag)
+        //  - valueChanged → write into the selected mask, kick debounce
+        // Mapping: exposure slider is in 1/100 stops (range -500..+500 = ±5
+        // stops, matching the global Exposure slider). Others are -100..+100.
+        auto wireMaskSlider = [this](QSlider* slider, QLabel* valueLabel,
+                                     float lps::LocalAdjustment::* field,
+                                     bool isExposureScale = false) {
+            connect(slider, &QSlider::sliderPressed,
+                    this, &MainWindow::pushUndoSnapshot);
+            connect(slider, &QSlider::valueChanged, this,
+                    [this, valueLabel, field, isExposureScale](int v) {
+                if (m_selectedMaskIndex < 0 ||
+                    m_selectedMaskIndex >= static_cast<int>(m_look.localAdjustments.size())) {
+                    return;   // no selection — slider should be disabled,
+                              // but defensive against race conditions
+                }
+                const float value = isExposureScale
+                    ? (static_cast<float>(v) / 100.0f)
+                    : static_cast<float>(v);
+                m_look.localAdjustments[m_selectedMaskIndex].*field = value;
+                if (valueLabel) valueLabel->setText(QString::number(v));
+                if (m_debounce) m_debounce->start();
+            });
+        };
+        wireMaskSlider(m_maskExposureSlider,    m_maskExposureValue,
+                       &lps::LocalAdjustment::exposure, /*exposure scale*/ true);
+        wireMaskSlider(m_maskBrightnessSlider,  m_maskBrightnessValue,
+                       &lps::LocalAdjustment::brightness);
+        wireMaskSlider(m_maskContrastSlider,    m_maskContrastValue,
+                       &lps::LocalAdjustment::contrast);
+        wireMaskSlider(m_maskSaturationSlider,  m_maskSaturationValue,
+                       &lps::LocalAdjustment::saturation);
+        wireMaskSlider(m_maskTemperatureSlider, m_maskTemperatureValue,
+                       &lps::LocalAdjustment::temperature);
+        wireMaskSlider(m_maskTintSlider,        m_maskTintValue,
+                       &lps::LocalAdjustment::tint);
+
+        // ---- Geometry / structural mask controls ----------------------------
+        // These edit WHERE the mask hits — name, enable-via-checkbox-row-above,
+        // invert, feather (geometry softness), density (overall strength),
+        // flow (brush placeholder), reset geometry button.
+        {
+            auto* row = new QHBoxLayout();
+            row->setContentsMargins(0, 4, 0, 0);
+            auto* lbl = new QLabel(tr("Name"), panel);
+            lbl->setMinimumWidth(60);
+            row->addWidget(lbl);
+            m_maskNameEdit = new QLineEdit(panel);
+            m_maskNameEdit->setPlaceholderText(tr("Mask name"));
+            // Commit on editing-finished (focus loss / Enter) — mid-typing
+            // shouldn't push undo entries per character. One snapshot
+            // before the edit, the post-commit value gets stored.
+            connect(m_maskNameEdit, &QLineEdit::editingFinished, this, [this]() {
+                if (m_selectedMaskIndex < 0 ||
+                    m_selectedMaskIndex >= static_cast<int>(m_look.localAdjustments.size())) {
+                    return;
+                }
+                auto& mask = m_look.localAdjustments[m_selectedMaskIndex];
+                const QString newName = m_maskNameEdit->text();
+                if (mask.name == newName) return;
+                pushUndoSnapshot();
+                mask.name = newName;
+                refreshUndoRedoActions();
+                refreshMaskWidgets();   // updates the list-row label
+                markDirty();
+            });
+            row->addWidget(m_maskNameEdit, /*stretch=*/1);
+            col->addLayout(row);
+        }
+
+        m_maskInvertCheck = new QCheckBox(tr("Invert mask"), panel);
+        m_maskInvertCheck->setCursor(Qt::PointingHandCursor);
+        m_maskInvertCheck->setEnabled(false);
+        connect(m_maskInvertCheck, &QCheckBox::toggled, this, [this](bool on) {
+            if (m_selectedMaskIndex < 0 ||
+                m_selectedMaskIndex >= static_cast<int>(m_look.localAdjustments.size())) {
+                return;
+            }
+            auto& mask = m_look.localAdjustments[m_selectedMaskIndex];
+            if (mask.invert == on) return;
+            pushUndoSnapshot();
+            mask.invert = on;
+            refreshUndoRedoActions();
+            // Geometry-equivalent change: invalidate overlay cache + render.
+            if (m_previewLabel) m_previewLabel->setActiveMask(&mask);   // forces cache rebuild
+            markDirty();
+            if (m_debounce) m_debounce->start();
+        });
+        col->addWidget(m_maskInvertCheck);
+
+        // Feather / Density / Flow sliders. Feather is shared with
+        // LocalAdjustment::feather (engine reads it). Density scales overall
+        // mask strength. Flow is a brush placeholder.
+        col->addWidget(buildSliderRow(tr("Feather"),
+                                      0, 100, 50,
+                                      m_maskFeatherSlider, m_maskFeatherValue));
+        col->addWidget(buildSliderRow(tr("Density"),
+                                      0, 100, 100,
+                                      m_maskDensitySlider, m_maskDensityValue));
+        col->addWidget(buildSliderRow(tr("Flow"),
+                                      0, 100, 100,
+                                      m_maskFlowSlider, m_maskFlowValue));
+
+        auto wireMaskGeoSlider = [this](QSlider* slider, QLabel* lbl,
+                                         float lps::LocalAdjustment::* field,
+                                         float scaleDiv) {
+            connect(slider, &QSlider::sliderPressed,
+                    this, &MainWindow::pushUndoSnapshot);
+            connect(slider, &QSlider::valueChanged, this,
+                    [this, lbl, field, scaleDiv](int v) {
+                if (m_selectedMaskIndex < 0 ||
+                    m_selectedMaskIndex >= static_cast<int>(m_look.localAdjustments.size())) {
+                    return;
+                }
+                auto& mask = m_look.localAdjustments[m_selectedMaskIndex];
+                mask.*field = static_cast<float>(v) / scaleDiv;
+                if (lbl) lbl->setText(QString::number(v));
+                // Geometry-changed: invalidate the overlay cache.
+                if (m_previewLabel) m_previewLabel->setActiveMask(&mask);
+                if (m_debounce) m_debounce->start();
+            });
+        };
+        wireMaskGeoSlider(m_maskFeatherSlider, m_maskFeatherValue,
+                          &lps::LocalAdjustment::feather, 100.0f);
+        wireMaskGeoSlider(m_maskDensitySlider, m_maskDensityValue,
+                          &lps::LocalAdjustment::density, 100.0f);
+        wireMaskGeoSlider(m_maskFlowSlider, m_maskFlowValue,
+                          &lps::LocalAdjustment::flow, 100.0f);
+
+        m_maskResetGeoBtn = new QPushButton(tr("Reset Mask Geometry"), panel);
+        m_maskResetGeoBtn->setCursor(Qt::PointingHandCursor);
+        m_maskResetGeoBtn->setEnabled(false);
+        connect(m_maskResetGeoBtn, &QPushButton::clicked,
+                this, &MainWindow::onResetMaskGeometry);
+        col->addWidget(m_maskResetGeoBtn);
+
+        // ---- Overlay controls -----------------------------------------------
+        // Show/hide overlay, opacity slider, view-mode dropdown. These
+        // drive PreviewWidget directly — no Look state involved (overlay
+        // is a UI-only preference, not part of the rendered image).
+        m_maskShowOverlayCheck = new QCheckBox(tr("Show Mask Overlay"), panel);
+        m_maskShowOverlayCheck->setChecked(true);
+        m_maskShowOverlayCheck->setCursor(Qt::PointingHandCursor);
+        connect(m_maskShowOverlayCheck, &QCheckBox::toggled, this, [this](bool on) {
+            if (m_previewLabel) m_previewLabel->setShowMaskOverlay(on);
+        });
+        col->addWidget(m_maskShowOverlayCheck);
+
+        col->addWidget(buildSliderRow(tr("Overlay Opacity"),
+                                      0, 100, 35,
+                                      m_maskOverlayOpacitySlider,
+                                      m_maskOverlayOpacityValue));
+        connect(m_maskOverlayOpacitySlider, &QSlider::valueChanged,
+                this, [this](int v) {
+            if (m_maskOverlayOpacityValue)
+                m_maskOverlayOpacityValue->setText(QString::number(v));
+            if (m_previewLabel)
+                m_previewLabel->setMaskOverlayOpacity(static_cast<float>(v) / 100.0f);
+        });
+
+        {
+            auto* row = new QHBoxLayout();
+            row->setContentsMargins(0, 0, 0, 0);
+            auto* lbl = new QLabel(tr("View Mode"), panel);
+            lbl->setMinimumWidth(80);
+            row->addWidget(lbl);
+            m_maskViewModeCombo = new QComboBox(panel);
+            m_maskViewModeCombo->addItem(tr("Overlay"));
+            m_maskViewModeCombo->addItem(tr("Black & White"));
+            m_maskViewModeCombo->addItem(tr("Marching Ants"));
+            m_maskViewModeCombo->addItem(tr("Off"));
+            connect(m_maskViewModeCombo,
+                    QOverload<int>::of(&QComboBox::currentIndexChanged),
+                    this, [this](int idx) {
+                if (!m_previewLabel) return;
+                m_previewLabel->setMaskViewMode(
+                    static_cast<PreviewWidget::MaskViewMode>(idx));
+                // BlackAndWhite affects the cached overlay's color, so
+                // we need a cache rebuild. The setActiveMask path forces
+                // that rebuild.
+                if (m_selectedMaskIndex >= 0 &&
+                    m_selectedMaskIndex < static_cast<int>(m_look.localAdjustments.size())) {
+                    m_previewLabel->setActiveMask(
+                        &m_look.localAdjustments[m_selectedMaskIndex]);
+                }
+            });
+            row->addWidget(m_maskViewModeCombo, /*stretch=*/1);
+            col->addLayout(row);
+        }
+
+        // Initial state — no masks, sliders disabled.
+        refreshMaskWidgets();
+    }
+
+    // ---- Section header: LAYERS -------------------------------------------
+    // Stackable adjustment layers (Photoshop/Lightroom-style). V1 is data
+    // + UI plumbing only — the pipeline doesn't yet composite layers on
+    // top of the base Look. The list, opacity, and blend mode all round-
+    // trip through save/load and undo/redo so projects authored now will
+    // pick up rendering once the compositor lands.
+    {
+        auto* layerHeader = new QLabel(tr("LAYERS"), panel);
+        layerHeader->setFont(hf);
+        layerHeader->setStyleSheet("color: #9A9AA0; padding-top: 4px;");
+        col->addWidget(layerHeader);
+
+        // Add / Duplicate / Delete row.
+        auto* btnRow = new QHBoxLayout();
+        btnRow->setContentsMargins(0, 0, 0, 0);
+        btnRow->setSpacing(4);
+        m_layerAddBtn = new QPushButton(tr("+ Layer"), panel);
+        m_layerAddBtn->setCursor(Qt::PointingHandCursor);
+        m_layerAddBtn->setToolTip(tr("Add a new adjustment layer"));
+        connect(m_layerAddBtn, &QPushButton::clicked,
+                this, &MainWindow::onAddLayer);
+        btnRow->addWidget(m_layerAddBtn);
+
+        m_layerDuplicateBtn = new QPushButton(tr("Duplicate"), panel);
+        m_layerDuplicateBtn->setCursor(Qt::PointingHandCursor);
+        m_layerDuplicateBtn->setToolTip(tr("Duplicate the selected layer"));
+        m_layerDuplicateBtn->setEnabled(false);
+        connect(m_layerDuplicateBtn, &QPushButton::clicked,
+                this, &MainWindow::onDuplicateLayer);
+        btnRow->addWidget(m_layerDuplicateBtn);
+
+        m_layerDeleteBtn = new QPushButton(tr("Delete"), panel);
+        m_layerDeleteBtn->setCursor(Qt::PointingHandCursor);
+        m_layerDeleteBtn->setEnabled(false);
+        connect(m_layerDeleteBtn, &QPushButton::clicked,
+                this, &MainWindow::onDeleteSelectedLayer);
+        btnRow->addWidget(m_layerDeleteBtn);
+        col->addLayout(btnRow);
+
+        // Layer list — same widget pattern as masks. Per-row checkbox
+        // for enabled-state, selection drives the opacity/blend controls.
+        m_layerList = new QListWidget(panel);
+        m_layerList->setSelectionMode(QAbstractItemView::SingleSelection);
+        m_layerList->setMinimumHeight(80);
+        m_layerList->setMaximumHeight(140);
+        m_layerList->setStyleSheet(
+            "QListWidget { background-color: #1c1c1f; "
+            "              border: 1px solid #2a2a2e; }");
+        connect(m_layerList, &QListWidget::itemSelectionChanged,
+                this, &MainWindow::onLayerListSelectionChanged);
+        connect(m_layerList, &QListWidget::itemChanged,
+                this, &MainWindow::onLayerItemChanged);
+        col->addWidget(m_layerList);
+
+        // Status label.
+        m_layerStatusLabel = new QLabel(tr("No layers"), panel);
+        m_layerStatusLabel->setStyleSheet("color: #8a8a90; font-style: italic;");
+        col->addWidget(m_layerStatusLabel);
+
+        // Opacity slider — 0..100% mapped to layer.opacity ∈ [0, 1].
+        col->addWidget(buildSliderRow(tr("Opacity"),
+                                      0, 100, 100,
+                                      m_layerOpacitySlider, m_layerOpacityValue));
+        connect(m_layerOpacitySlider, &QSlider::sliderPressed,
+                this, &MainWindow::pushUndoSnapshot);
+        connect(m_layerOpacitySlider, &QSlider::valueChanged,
+                this, &MainWindow::onLayerOpacityChanged);
+
+        // Blend mode dropdown. The integer index matches the BlendMode
+        // enum value — keep this list in sync with the enum.
+        auto* blendRow = new QHBoxLayout();
+        blendRow->setContentsMargins(0, 0, 0, 0);
+        auto* blendLabel = new QLabel(tr("Blend"), panel);
+        blendLabel->setMinimumWidth(60);
+        blendRow->addWidget(blendLabel);
+        m_layerBlendModeCombo = new QComboBox(panel);
+        m_layerBlendModeCombo->addItem(tr("Normal"));
+        m_layerBlendModeCombo->addItem(tr("Multiply"));
+        m_layerBlendModeCombo->addItem(tr("Screen"));
+        m_layerBlendModeCombo->addItem(tr("Overlay"));
+        m_layerBlendModeCombo->addItem(tr("Soft Light"));
+        m_layerBlendModeCombo->addItem(tr("Hard Light"));
+        m_layerBlendModeCombo->addItem(tr("Color Dodge"));
+        m_layerBlendModeCombo->addItem(tr("Color Burn"));
+        m_layerBlendModeCombo->addItem(tr("Darken"));
+        m_layerBlendModeCombo->addItem(tr("Lighten"));
+        m_layerBlendModeCombo->addItem(tr("Difference"));
+        m_layerBlendModeCombo->setEnabled(false);
+        connect(m_layerBlendModeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+                this, &MainWindow::onLayerBlendModeChanged);
+        blendRow->addWidget(m_layerBlendModeCombo, /*stretch=*/1);
+        col->addLayout(blendRow);
+
+        // Initial state — no layers, controls disabled.
+        refreshLayerWidgets();
+    }
 
     col->addStretch(1);
 
@@ -1295,6 +1865,17 @@ void MainWindow::applyLookToUi()
     // updates are signal-blocked internally to avoid kicking the debounce
     // a second time.
     refreshGradingWidgets();
+
+    // ---- Local masks ------------------------------------------------------
+    // Rebuild the mask list and re-sync the per-mask sliders. Handles undo/
+    // redo replacing m_look entirely, project/preset load with new masks,
+    // and selection-index clamping when the list shrinks.
+    refreshMaskWidgets();
+
+    // ---- Adjustment layers ------------------------------------------------
+    // Same lifecycle handling as masks — list rebuild + selection clamp +
+    // per-layer control sync.
+    refreshLayerWidgets();
 
     // ---- Kick a render ----------------------------------------------------
     // One debounce restart, not one per setter. The debounce will coalesce
@@ -2410,10 +2991,572 @@ void MainWindow::refreshLutWidgets()
     }
     m_lutOpacityValue->setText(QString::number(sliderValue));
 
+    // Sync the enabled checkbox. Stays interactive only when a LUT is
+    // actually loaded — otherwise toggling it does nothing useful.
+    if (m_lutEnabledCheck) {
+        QSignalBlocker block(m_lutEnabledCheck);
+        m_lutEnabledCheck->setChecked(m_look.grading.lutEnabled);
+        m_lutEnabledCheck->setEnabled(hasLut);
+    }
+
     // Disable the opacity slider and Clear button when no LUT is loaded —
     // they have nothing to act on. The Load LUT button stays enabled.
+    // When the LUT is loaded but disabled via checkbox, the opacity
+    // slider stays editable so users can pre-adjust before re-enabling.
     m_lutOpacitySlider->setEnabled(hasLut);
     if (m_lutClearBtn) m_lutClearBtn->setEnabled(hasLut);
+}
+
+// ==============================================================================
+// Local masks — slot implementations
+//
+// All mutations push an undo snapshot first. After mutating m_look, we
+// always:
+//   1. refreshMaskWidgets()      — sync UI to new state
+//   2. refreshUndoRedoActions()  — sync menu enable-state
+//   3. markDirty() + debounce    — kick a render
+//
+// The selected-mask index is the source of truth for which mask the
+// detail sliders edit. refreshMaskWidgets is responsible for clamping
+// the index when masks are added/removed/reordered.
+// ==============================================================================
+void MainWindow::addMaskCommon(lps::LocalAdjustment&& mask, const QString& kind)
+{
+    pushUndoSnapshot();
+
+    // Default name pattern: "Linear 1", "Radial 2", etc. — index by total
+    // count so users can tell masks apart at a glance. They can rename
+    // later (rename UI not in this step but the data field exists).
+    if (mask.name.isEmpty()) {
+        mask.name = QStringLiteral("%1 %2")
+            .arg(kind)
+            .arg(m_look.localAdjustments.size() + 1);
+    }
+    m_look.localAdjustments.push_back(std::move(mask));
+
+    // Select the newly-added mask so the user can immediately adjust it.
+    m_selectedMaskIndex = static_cast<int>(m_look.localAdjustments.size()) - 1;
+
+    refreshMaskWidgets();
+    refreshUndoRedoActions();
+    markDirty();
+    if (m_debounce) m_debounce->start();
+}
+
+void MainWindow::onAddLinearMask()
+{
+    lps::LocalAdjustment m;
+    m.type = lps::MaskType::LinearGradient;
+    // Default: top-of-frame downward — like Lightroom's "darken sky" gradient.
+    m.startPoint = QPointF(0.5, 0.0);
+    m.endPoint   = QPointF(0.5, 0.4);
+    m.feather    = 0.5f;
+    addMaskCommon(std::move(m), tr("Linear"));
+}
+
+void MainWindow::onAddRadialMask()
+{
+    lps::LocalAdjustment m;
+    m.type = lps::MaskType::RadialGradient;
+    // Default: middle of frame, quarter-image radius.
+    m.center  = QPointF(0.5, 0.5);
+    m.radius  = 0.25f;
+    m.feather = 0.5f;
+    addMaskCommon(std::move(m), tr("Radial"));
+}
+
+void MainWindow::onAddBrushMask()
+{
+    lps::LocalAdjustment m;
+    m.type = lps::MaskType::Brush;
+    // Brush is a placeholder — V1 LocalAdjustmentEngine treats brush masks
+    // as zero-weight everywhere, so this entry is inert until the brush
+    // UI lands. The data round-trips through save/load correctly, which
+    // is the spec's first-version requirement.
+    addMaskCommon(std::move(m), tr("Brush"));
+}
+
+void MainWindow::onDeleteSelectedMask()
+{
+    if (m_selectedMaskIndex < 0 ||
+        m_selectedMaskIndex >= static_cast<int>(m_look.localAdjustments.size())) {
+        return;
+    }
+
+    pushUndoSnapshot();
+
+    m_look.localAdjustments.erase(
+        m_look.localAdjustments.begin() + m_selectedMaskIndex);
+
+    // Adjust selection: stay at the same row index if possible (selecting
+    // the mask that was below the deleted one), or move up if we deleted
+    // the last mask. -1 if no masks remain.
+    const int total = static_cast<int>(m_look.localAdjustments.size());
+    if (total == 0) {
+        m_selectedMaskIndex = -1;
+    } else if (m_selectedMaskIndex >= total) {
+        m_selectedMaskIndex = total - 1;
+    }
+
+    refreshMaskWidgets();
+    refreshUndoRedoActions();
+    markDirty();
+    if (m_debounce) m_debounce->start();
+}
+
+void MainWindow::onMaskListSelectionChanged()
+{
+    if (!m_maskList) return;
+    const int row = m_maskList->currentRow();
+    if (row == m_selectedMaskIndex) return;
+    m_selectedMaskIndex = row;
+    // Refresh the per-mask sliders for the new selection. No undo push —
+    // selection change isn't an edit. No render kick either.
+    refreshMaskWidgets();
+}
+
+void MainWindow::onMaskItemChanged(QListWidgetItem* item)
+{
+    // Triggered when the user toggles the per-row checkbox. Map the
+    // checkbox state into the mask's enabled flag. Push undo so the
+    // toggle is reversible; signal-blocked refresh prevents loops.
+    if (!m_maskList || !item) return;
+    const int row = m_maskList->row(item);
+    if (row < 0 || row >= static_cast<int>(m_look.localAdjustments.size())) return;
+
+    const bool checked = (item->checkState() == Qt::Checked);
+    if (m_look.localAdjustments[row].enabled == checked) return;
+
+    pushUndoSnapshot();
+    m_look.localAdjustments[row].enabled = checked;
+    refreshUndoRedoActions();
+    markDirty();
+    if (m_debounce) m_debounce->start();
+}
+
+// Rebuild m_maskList rows from m_look.localAdjustments and refresh the
+// per-mask sliders from the currently-selected entry. Signal-blocked
+// internally so it doesn't kick the debounce or re-fire the selection-
+// changed slot.
+//
+// Called from:
+//   - applyLookToUi (undo/redo, project load, preset load)
+//   - the add/delete slots
+//   - construction (initial state)
+void MainWindow::refreshMaskWidgets()
+{
+    if (!m_maskList) return;
+
+    const int total = static_cast<int>(m_look.localAdjustments.size());
+
+    // Clamp the selection if the list shrank (e.g. after undo/redo).
+    if (m_selectedMaskIndex >= total) m_selectedMaskIndex = total - 1;
+    if (m_selectedMaskIndex < 0 && total > 0) m_selectedMaskIndex = 0;
+
+    // Rebuild the list rows. We tear down and recreate rather than
+    // reconciling — masks don't typically have hundreds of entries, and
+    // the simpler logic avoids stale-row-state bugs.
+    {
+        QSignalBlocker block(m_maskList);
+        m_maskList->clear();
+        for (int i = 0; i < total; ++i) {
+            const auto& la = m_look.localAdjustments[i];
+            QString typeStr;
+            switch (la.type) {
+                case lps::MaskType::LinearGradient: typeStr = tr("Linear");  break;
+                case lps::MaskType::RadialGradient: typeStr = tr("Radial");  break;
+                case lps::MaskType::Brush:          typeStr = tr("Brush");   break;
+            }
+            const QString display = la.name.isEmpty()
+                ? QStringLiteral("(%1 %2)").arg(typeStr).arg(i + 1)
+                : QStringLiteral("%1  —  %2").arg(la.name, typeStr);
+
+            auto* item = new QListWidgetItem(display, m_maskList);
+            item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
+            item->setCheckState(la.enabled ? Qt::Checked : Qt::Unchecked);
+        }
+        if (m_selectedMaskIndex >= 0 && m_selectedMaskIndex < total) {
+            m_maskList->setCurrentRow(m_selectedMaskIndex);
+        }
+    }
+
+    // Sync the detail sliders + status label.
+    const bool hasSelection = (m_selectedMaskIndex >= 0 &&
+                                m_selectedMaskIndex < total);
+    if (m_maskDeleteBtn) m_maskDeleteBtn->setEnabled(hasSelection);
+
+    auto setSlider = [](QSlider* s, QLabel* lbl, int v) {
+        if (!s) return;
+        QSignalBlocker b(s);
+        s->setValue(v);
+        if (lbl) lbl->setText(QString::number(v));
+    };
+    auto setEnabled = [hasSelection](QSlider* s) {
+        if (s) s->setEnabled(hasSelection);
+    };
+    setEnabled(m_maskExposureSlider);
+    setEnabled(m_maskBrightnessSlider);
+    setEnabled(m_maskContrastSlider);
+    setEnabled(m_maskSaturationSlider);
+    setEnabled(m_maskTemperatureSlider);
+    setEnabled(m_maskTintSlider);
+
+    // Geometry controls follow the same enable rule.
+    setEnabled(m_maskFeatherSlider);
+    setEnabled(m_maskDensitySlider);
+    setEnabled(m_maskFlowSlider);
+    if (m_maskNameEdit)    m_maskNameEdit->setEnabled(hasSelection);
+    if (m_maskInvertCheck) m_maskInvertCheck->setEnabled(hasSelection);
+    if (m_maskResetGeoBtn) m_maskResetGeoBtn->setEnabled(hasSelection);
+
+    if (hasSelection) {
+        const auto& la = m_look.localAdjustments[m_selectedMaskIndex];
+        setSlider(m_maskExposureSlider,    m_maskExposureValue,
+                  static_cast<int>(std::lround(la.exposure * 100.0f)));
+        setSlider(m_maskBrightnessSlider,  m_maskBrightnessValue,
+                  static_cast<int>(std::lround(la.brightness)));
+        setSlider(m_maskContrastSlider,    m_maskContrastValue,
+                  static_cast<int>(std::lround(la.contrast)));
+        setSlider(m_maskSaturationSlider,  m_maskSaturationValue,
+                  static_cast<int>(std::lround(la.saturation)));
+        setSlider(m_maskTemperatureSlider, m_maskTemperatureValue,
+                  static_cast<int>(std::lround(la.temperature)));
+        setSlider(m_maskTintSlider,        m_maskTintValue,
+                  static_cast<int>(std::lround(la.tint)));
+
+        // Geometry controls — feather/density/flow as 0..100 slider values.
+        setSlider(m_maskFeatherSlider, m_maskFeatherValue,
+                  static_cast<int>(std::lround(la.feather * 100.0f)));
+        setSlider(m_maskDensitySlider, m_maskDensityValue,
+                  static_cast<int>(std::lround(la.density * 100.0f)));
+        setSlider(m_maskFlowSlider, m_maskFlowValue,
+                  static_cast<int>(std::lround(la.flow * 100.0f)));
+
+        if (m_maskNameEdit) {
+            QSignalBlocker b(m_maskNameEdit);
+            m_maskNameEdit->setText(la.name);
+        }
+        if (m_maskInvertCheck) {
+            QSignalBlocker b(m_maskInvertCheck);
+            m_maskInvertCheck->setChecked(la.invert);
+        }
+
+        if (m_maskStatusLabel) {
+            m_maskStatusLabel->setText(
+                tr("Selected: %1").arg(la.name.isEmpty()
+                                       ? tr("(unnamed)") : la.name));
+        }
+    } else {
+        // Zero out the sliders visually so an old selection's values
+        // don't linger after the mask is deleted.
+        setSlider(m_maskExposureSlider,    m_maskExposureValue,    0);
+        setSlider(m_maskBrightnessSlider,  m_maskBrightnessValue,  0);
+        setSlider(m_maskContrastSlider,    m_maskContrastValue,    0);
+        setSlider(m_maskSaturationSlider,  m_maskSaturationValue,  0);
+        setSlider(m_maskTemperatureSlider, m_maskTemperatureValue, 0);
+        setSlider(m_maskTintSlider,        m_maskTintValue,        0);
+
+        setSlider(m_maskFeatherSlider, m_maskFeatherValue, 50);
+        setSlider(m_maskDensitySlider, m_maskDensityValue, 100);
+        setSlider(m_maskFlowSlider,    m_maskFlowValue,    100);
+        if (m_maskNameEdit) {
+            QSignalBlocker b(m_maskNameEdit);
+            m_maskNameEdit->clear();
+        }
+        if (m_maskInvertCheck) {
+            QSignalBlocker b(m_maskInvertCheck);
+            m_maskInvertCheck->setChecked(false);
+        }
+
+        if (m_maskStatusLabel) {
+            m_maskStatusLabel->setText(total == 0
+                ? tr("No masks") : tr("No mask selected"));
+        }
+    }
+
+    // Push the active-mask pointer to PreviewWidget so the overlay and
+    // handles update without needing a manual refresh hop.
+    syncActiveMaskToPreview();
+}
+
+// ==============================================================================
+// Mask geometry helpers
+//
+// syncActiveMaskToPreview hands the selected mask pointer to the preview
+// so it can paint its overlay and handles. Pointer stability: m_look is
+// a member variable; m_look.localAdjustments is a std::vector that may
+// reallocate on push_back/erase, so this function is called after any
+// mutation that could move the underlying storage.
+//
+// onMaskGeometryChangedFromPreview fires when the user drags a handle
+// in the preview. We mark dirty + kick a render. The preview already
+// invalidated its overlay cache and called update().
+//
+// onResetMaskGeometry returns the selected mask to its type-default
+// geometry (matching the values onAddLinearMask/onAddRadialMask use).
+// ==============================================================================
+void MainWindow::syncActiveMaskToPreview()
+{
+    if (!m_previewLabel) return;
+    if (m_selectedMaskIndex < 0 ||
+        m_selectedMaskIndex >= static_cast<int>(m_look.localAdjustments.size())) {
+        m_previewLabel->setActiveMask(nullptr);
+        return;
+    }
+    m_previewLabel->setActiveMask(
+        &m_look.localAdjustments[m_selectedMaskIndex]);
+}
+
+void MainWindow::onMaskGeometryChangedFromPreview()
+{
+    // The preview already updated its overlay cache and repainted. We
+    // just need to refresh dependent UI (no slider values change from
+    // a handle drag — geometry is the only thing affected) and kick
+    // the render debounce so the masked adjustment renders into the
+    // photo.
+    refreshUndoRedoActions();
+    markDirty();
+    if (m_debounce) m_debounce->start();
+}
+
+void MainWindow::onResetMaskGeometry()
+{
+    if (m_selectedMaskIndex < 0 ||
+        m_selectedMaskIndex >= static_cast<int>(m_look.localAdjustments.size())) {
+        return;
+    }
+    pushUndoSnapshot();
+
+    auto& mask = m_look.localAdjustments[m_selectedMaskIndex];
+    switch (mask.type) {
+    case lps::MaskType::LinearGradient:
+        mask.startPoint = QPointF(0.5, 0.0);
+        mask.endPoint   = QPointF(0.5, 0.4);
+        mask.feather    = 0.5f;
+        break;
+    case lps::MaskType::RadialGradient:
+        mask.center  = QPointF(0.5, 0.5);
+        mask.radius  = 0.25f;
+        mask.feather = 0.5f;
+        break;
+    case lps::MaskType::Brush:
+        mask.brushStamps.clear();
+        break;
+    }
+    mask.invert  = false;
+    mask.density = 1.0f;
+    mask.flow    = 1.0f;
+
+    refreshMaskWidgets();
+    refreshUndoRedoActions();
+    markDirty();
+    if (m_debounce) m_debounce->start();
+}
+
+// ==============================================================================
+// Adjustment layers — slot implementations
+//
+// Same pattern as masks: every mutation pushes an undo snapshot, then
+// updates m_look, then refreshes the UI and kicks a render. Selection
+// index is the source of truth for which layer the controls edit.
+//
+// Layer rendering itself is V1-placeholder — the pipeline does not yet
+// composite layers on top of the base Look. Save/load + undo/redo of
+// layer data work today so users can author layered projects that
+// "wake up" once compositing lands.
+// ==============================================================================
+void MainWindow::onAddLayer()
+{
+    pushUndoSnapshot();
+
+    lps::AdjustmentLayer layer;
+    layer.name = QStringLiteral("Layer %1")
+                     .arg(m_look.adjustmentLayers.size() + 1);
+    // Default identity Look — user populates the layer's adjustments via
+    // future layer-editing UI (out of scope for V1).
+    m_look.adjustmentLayers.push_back(std::move(layer));
+    m_selectedLayerIndex =
+        static_cast<int>(m_look.adjustmentLayers.size()) - 1;
+
+    refreshLayerWidgets();
+    refreshUndoRedoActions();
+    markDirty();
+    if (m_debounce) m_debounce->start();
+}
+
+void MainWindow::onDuplicateLayer()
+{
+    if (m_selectedLayerIndex < 0 ||
+        m_selectedLayerIndex >= static_cast<int>(m_look.adjustmentLayers.size())) {
+        return;
+    }
+
+    pushUndoSnapshot();
+
+    // Deep copy: AdjustmentLayer is value-semantic (Look + scalars +
+    // QString), so the default copy ctor produces a fully independent
+    // duplicate. The duplicated layer sits immediately after the source.
+    lps::AdjustmentLayer dup = m_look.adjustmentLayers[m_selectedLayerIndex];
+    if (!dup.name.endsWith(tr(" copy"))) dup.name += tr(" copy");
+    m_look.adjustmentLayers.insert(
+        m_look.adjustmentLayers.begin() + m_selectedLayerIndex + 1,
+        std::move(dup));
+    m_selectedLayerIndex += 1;   // select the new duplicate
+
+    refreshLayerWidgets();
+    refreshUndoRedoActions();
+    markDirty();
+    if (m_debounce) m_debounce->start();
+}
+
+void MainWindow::onDeleteSelectedLayer()
+{
+    if (m_selectedLayerIndex < 0 ||
+        m_selectedLayerIndex >= static_cast<int>(m_look.adjustmentLayers.size())) {
+        return;
+    }
+
+    pushUndoSnapshot();
+
+    m_look.adjustmentLayers.erase(
+        m_look.adjustmentLayers.begin() + m_selectedLayerIndex);
+
+    const int total = static_cast<int>(m_look.adjustmentLayers.size());
+    if (total == 0) m_selectedLayerIndex = -1;
+    else if (m_selectedLayerIndex >= total) m_selectedLayerIndex = total - 1;
+
+    refreshLayerWidgets();
+    refreshUndoRedoActions();
+    markDirty();
+    if (m_debounce) m_debounce->start();
+}
+
+void MainWindow::onLayerListSelectionChanged()
+{
+    if (!m_layerList) return;
+    const int row = m_layerList->currentRow();
+    if (row == m_selectedLayerIndex) return;
+    m_selectedLayerIndex = row;
+    refreshLayerWidgets();
+}
+
+void MainWindow::onLayerItemChanged(QListWidgetItem* item)
+{
+    if (!m_layerList || !item) return;
+    const int row = m_layerList->row(item);
+    if (row < 0 || row >= static_cast<int>(m_look.adjustmentLayers.size())) return;
+
+    const bool checked = (item->checkState() == Qt::Checked);
+    if (m_look.adjustmentLayers[row].enabled == checked) return;
+
+    pushUndoSnapshot();
+    m_look.adjustmentLayers[row].enabled = checked;
+    refreshUndoRedoActions();
+    markDirty();
+    if (m_debounce) m_debounce->start();
+}
+
+void MainWindow::onLayerOpacityChanged(int v)
+{
+    if (m_selectedLayerIndex < 0 ||
+        m_selectedLayerIndex >= static_cast<int>(m_look.adjustmentLayers.size())) {
+        return;
+    }
+    m_look.adjustmentLayers[m_selectedLayerIndex].opacity =
+        static_cast<float>(v) / 100.0f;
+    if (m_layerOpacityValue) {
+        m_layerOpacityValue->setText(QString::number(v));
+    }
+    if (m_debounce) m_debounce->start();
+}
+
+void MainWindow::onLayerBlendModeChanged(int comboIndex)
+{
+    if (m_selectedLayerIndex < 0 ||
+        m_selectedLayerIndex >= static_cast<int>(m_look.adjustmentLayers.size())) {
+        return;
+    }
+    if (comboIndex < 0 || comboIndex > 10) return;
+    // Combo selection: push undo (one snapshot per change — there's no
+    // "drag" boundary like a slider has).
+    auto& layer = m_look.adjustmentLayers[m_selectedLayerIndex];
+    const auto newMode = static_cast<lps::BlendMode>(comboIndex);
+    if (layer.blendMode == newMode) return;
+    pushUndoSnapshot();
+    layer.blendMode = newMode;
+    refreshUndoRedoActions();
+    markDirty();
+    if (m_debounce) m_debounce->start();
+}
+
+void MainWindow::refreshLayerWidgets()
+{
+    if (!m_layerList) return;
+
+    const int total = static_cast<int>(m_look.adjustmentLayers.size());
+
+    // Clamp selection if list shrank.
+    if (m_selectedLayerIndex >= total) m_selectedLayerIndex = total - 1;
+    if (m_selectedLayerIndex < 0 && total > 0) m_selectedLayerIndex = 0;
+
+    {
+        QSignalBlocker block(m_layerList);
+        m_layerList->clear();
+        for (int i = 0; i < total; ++i) {
+            const auto& al = m_look.adjustmentLayers[i];
+            const QString display = al.name.isEmpty()
+                ? QStringLiteral("Layer %1").arg(i + 1)
+                : al.name;
+            auto* item = new QListWidgetItem(display, m_layerList);
+            item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
+            item->setCheckState(al.enabled ? Qt::Checked : Qt::Unchecked);
+        }
+        if (m_selectedLayerIndex >= 0 && m_selectedLayerIndex < total) {
+            m_layerList->setCurrentRow(m_selectedLayerIndex);
+        }
+    }
+
+    const bool hasSelection = (m_selectedLayerIndex >= 0 &&
+                                m_selectedLayerIndex < total);
+    if (m_layerDeleteBtn)    m_layerDeleteBtn->setEnabled(hasSelection);
+    if (m_layerDuplicateBtn) m_layerDuplicateBtn->setEnabled(hasSelection);
+    if (m_layerOpacitySlider)  m_layerOpacitySlider->setEnabled(hasSelection);
+    if (m_layerBlendModeCombo) m_layerBlendModeCombo->setEnabled(hasSelection);
+
+    if (hasSelection) {
+        const auto& al = m_look.adjustmentLayers[m_selectedLayerIndex];
+        const int opacityPct = static_cast<int>(std::lround(al.opacity * 100.0f));
+        if (m_layerOpacitySlider) {
+            QSignalBlocker b(m_layerOpacitySlider);
+            m_layerOpacitySlider->setValue(opacityPct);
+        }
+        if (m_layerOpacityValue) {
+            m_layerOpacityValue->setText(QString::number(opacityPct));
+        }
+        if (m_layerBlendModeCombo) {
+            QSignalBlocker b(m_layerBlendModeCombo);
+            m_layerBlendModeCombo->setCurrentIndex(static_cast<int>(al.blendMode));
+        }
+        if (m_layerStatusLabel) {
+            m_layerStatusLabel->setText(
+                tr("Selected: %1").arg(al.name.isEmpty()
+                                        ? tr("(unnamed)") : al.name));
+        }
+    } else {
+        if (m_layerOpacitySlider) {
+            QSignalBlocker b(m_layerOpacitySlider);
+            m_layerOpacitySlider->setValue(100);
+        }
+        if (m_layerOpacityValue) m_layerOpacityValue->setText(QStringLiteral("100"));
+        if (m_layerBlendModeCombo) {
+            QSignalBlocker b(m_layerBlendModeCombo);
+            m_layerBlendModeCombo->setCurrentIndex(0);
+        }
+        if (m_layerStatusLabel) {
+            m_layerStatusLabel->setText(total == 0
+                ? tr("No layers") : tr("No layer selected"));
+        }
+    }
 }
 
 // ==============================================================================
@@ -2436,12 +3579,13 @@ struct WheelFields {
     float lps::GradingParams::* hue;
     float lps::GradingParams::* sat;
     float lps::GradingParams::* str;
+    float lps::GradingParams::* lum;
 };
 constexpr WheelFields kWheels[4] = {
-    { &lps::GradingParams::shadowsHue,    &lps::GradingParams::shadowsSaturation,    &lps::GradingParams::shadowsStrength    },
-    { &lps::GradingParams::midtonesHue,   &lps::GradingParams::midtonesSaturation,   &lps::GradingParams::midtonesStrength   },
-    { &lps::GradingParams::highlightsHue, &lps::GradingParams::highlightsSaturation, &lps::GradingParams::highlightsStrength },
-    { &lps::GradingParams::globalHue,     &lps::GradingParams::globalSaturation,     &lps::GradingParams::globalStrength     },
+    { &lps::GradingParams::shadowsHue,    &lps::GradingParams::shadowsSaturation,    &lps::GradingParams::shadowsStrength,    &lps::GradingParams::shadowsLuminance    },
+    { &lps::GradingParams::midtonesHue,   &lps::GradingParams::midtonesSaturation,   &lps::GradingParams::midtonesStrength,   &lps::GradingParams::midtonesLuminance   },
+    { &lps::GradingParams::highlightsHue, &lps::GradingParams::highlightsSaturation, &lps::GradingParams::highlightsStrength, &lps::GradingParams::highlightsLuminance },
+    { &lps::GradingParams::globalHue,     &lps::GradingParams::globalSaturation,     &lps::GradingParams::globalStrength,     &lps::GradingParams::globalLuminance     },
 };
 
 } // namespace
@@ -2455,9 +3599,8 @@ void MainWindow::buildGradingWheel(QWidget* parent, QVBoxLayout* col,
     const WheelFields fields = kWheels[wheelIndex];
 
     // Header: a flat QToolButton with text "▾ Title" that toggles the
-    // body's visibility. We use a QToolButton (not a QPushButton) so we
-    // can keep the styling minimal — the button reads as a clickable
-    // header rather than a chunky 3D button.
+    // body's visibility. Same look as before — keep the existing
+    // collapsibility convention.
     auto* header = new QToolButton(parent);
     header->setText(QString::fromUtf8("▾ ") + title);
     header->setToolButtonStyle(Qt::ToolButtonTextOnly);
@@ -2470,28 +3613,63 @@ void MainWindow::buildGradingWheel(QWidget* parent, QVBoxLayout* col,
     col->addWidget(header);
     w.header = header;
 
-    // Body: three sliders in a column, parented to a container so we can
-    // toggle their visibility as a group via a single setVisible call.
+    // Body: ColorWheelWidget on top, two sliders (Strength + Luminance)
+    // below, plus a per-wheel reset button. Parented to a container so
+    // we can toggle the whole group via setVisible.
     auto* box = new QWidget(parent);
     auto* boxLay = new QVBoxLayout(box);
-    boxLay->setContentsMargins(8, 0, 0, 0);   // small left indent
-    boxLay->setSpacing(2);
+    boxLay->setContentsMargins(8, 0, 0, 0);
+    boxLay->setSpacing(4);
 
-    boxLay->addWidget(buildSliderRow(tr("Hue"),
-                                     0, 360, 0,
-                                     w.hue, w.hueValue));
-    boxLay->addWidget(buildSliderRow(tr("Saturation"),
-                                     0, 100, 0,
-                                     w.sat, w.satValue));
+    // Wheel + small numeric readout row. The readout shows the current
+    // hue (deg) and sat (%) so users have a quantitative reference.
+    auto* wheelRow = new QHBoxLayout();
+    wheelRow->setContentsMargins(0, 0, 0, 0);
+    wheelRow->setSpacing(8);
+
+    w.wheel = new ColorWheelWidget(box);
+    w.wheel->setMinimumSize(110, 110);
+    w.wheel->setMaximumSize(140, 140);
+    wheelRow->addWidget(w.wheel, /*stretch=*/0);
+
+    auto* readout = new QVBoxLayout();
+    readout->setContentsMargins(0, 0, 0, 0);
+    readout->setSpacing(2);
+    auto makeRO = [&](const QString& label, QLabel*& valueOut) {
+        auto* lbl = new QLabel(label, box);
+        lbl->setStyleSheet("color: #8a8a90; font-size: 10px;");
+        readout->addWidget(lbl);
+        valueOut = new QLabel("0", box);
+        valueOut->setStyleSheet("color: #d0d0d4; font-size: 11px; font-weight: bold;");
+        readout->addWidget(valueOut);
+    };
+    makeRO(tr("Hue"), w.hueValue);
+    makeRO(tr("Sat"), w.satValue);
+
+    // Reset button — clears hue/sat/str/lum for this wheel.
+    w.resetBtn = new QPushButton(tr("Reset"), box);
+    w.resetBtn->setCursor(Qt::PointingHandCursor);
+    w.resetBtn->setStyleSheet(
+        "QPushButton { padding: 2px 6px; font-size: 10px; }");
+    readout->addWidget(w.resetBtn);
+    readout->addStretch(1);
+
+    wheelRow->addLayout(readout, /*stretch=*/1);
+    boxLay->addLayout(wheelRow);
+
+    // Strength + Luminance sliders.
     boxLay->addWidget(buildSliderRow(tr("Strength"),
                                      0, 100, 0,
                                      w.str, w.strValue));
+    boxLay->addWidget(buildSliderRow(tr("Luminance"),
+                                     -100, +100, 0,
+                                     w.lum, w.lumValue));
+
     col->addWidget(box);
     w.slidersBox = box;
     w.expanded = true;
 
-    // Header toggle: hide/show the body. Update the chevron glyph so users
-    // see the state at a glance.
+    // Header toggle.
     connect(header, &QToolButton::clicked, this,
             [this, wheelIndex, title]() {
         auto& wi = m_gradingWheels[wheelIndex];
@@ -2502,34 +3680,71 @@ void MainWindow::buildGradingWheel(QWidget* parent, QVBoxLayout* col,
                          : QString::fromUtf8("▸ ")) + title);
     });
 
-    // Slider wiring. Each slider:
-    //   - sliderPressed → pushUndoSnapshot (one snapshot per drag)
-    //   - valueChanged  → write to m_look.grading via the wheel's
-    //                     pointer-to-member, update label, kick debounce
-    connect(w.hue, &QSlider::sliderPressed,
+    // Wheel wiring.
+    //   - dragStarted   → pushUndoSnapshot (one snapshot per drag)
+    //   - hueSatChanged → write to m_look.grading via pointer-to-member,
+    //                     update readouts, kick debounce
+    //   - resetRequested→ reset wheel to identity (push undo first)
+    connect(w.wheel, &ColorWheelWidget::dragStarted,
             this, &MainWindow::pushUndoSnapshot);
-    connect(w.hue, &QSlider::valueChanged, this,
-            [this, fields, &w](int v) {
-        m_look.grading.*(fields.hue) = static_cast<float>(v);
-        if (w.hueValue) w.hueValue->setText(QString::number(v));
+    connect(w.wheel, &ColorWheelWidget::hueSaturationChanged, this,
+            [this, fields, &w](float hueDeg, float sat01) {
+        m_look.grading.*(fields.hue) = hueDeg;
+        m_look.grading.*(fields.sat) = sat01 * 100.0f;
+        if (w.hueValue) w.hueValue->setText(
+            QString::number(static_cast<int>(std::lround(hueDeg))) + QStringLiteral("°"));
+        if (w.satValue) w.satValue->setText(
+            QString::number(static_cast<int>(std::lround(sat01 * 100.0f))) + QStringLiteral("%"));
+        if (m_debounce) m_debounce->start();
+    });
+    connect(w.wheel, &ColorWheelWidget::resetRequested, this,
+            [this, wheelIndex]() {
+        pushUndoSnapshot();
+        const auto& f = kWheels[wheelIndex];
+        m_look.grading.*(f.hue) = 0.0f;
+        m_look.grading.*(f.sat) = 0.0f;
+        // Reset only hue+sat from the wheel's double-click — strength
+        // and luminance are separate user-controlled values; don't
+        // surprise the user by clearing them. The Reset button below
+        // clears everything for this wheel.
+        refreshGradingWidgets();
+        refreshUndoRedoActions();
+        markDirty();
         if (m_debounce) m_debounce->start();
     });
 
-    connect(w.sat, &QSlider::sliderPressed,
-            this, &MainWindow::pushUndoSnapshot);
-    connect(w.sat, &QSlider::valueChanged, this,
-            [this, fields, &w](int v) {
-        m_look.grading.*(fields.sat) = static_cast<float>(v);
-        if (w.satValue) w.satValue->setText(QString::number(v));
-        if (m_debounce) m_debounce->start();
-    });
-
+    // Strength slider.
     connect(w.str, &QSlider::sliderPressed,
             this, &MainWindow::pushUndoSnapshot);
     connect(w.str, &QSlider::valueChanged, this,
             [this, fields, &w](int v) {
         m_look.grading.*(fields.str) = static_cast<float>(v);
         if (w.strValue) w.strValue->setText(QString::number(v));
+        if (m_debounce) m_debounce->start();
+    });
+
+    // Luminance slider.
+    connect(w.lum, &QSlider::sliderPressed,
+            this, &MainWindow::pushUndoSnapshot);
+    connect(w.lum, &QSlider::valueChanged, this,
+            [this, fields, &w](int v) {
+        m_look.grading.*(fields.lum) = static_cast<float>(v);
+        if (w.lumValue) w.lumValue->setText(QString::number(v));
+        if (m_debounce) m_debounce->start();
+    });
+
+    // Reset button — clears all four fields for this wheel.
+    connect(w.resetBtn, &QPushButton::clicked, this,
+            [this, wheelIndex]() {
+        pushUndoSnapshot();
+        const auto& f = kWheels[wheelIndex];
+        m_look.grading.*(f.hue) = 0.0f;
+        m_look.grading.*(f.sat) = 0.0f;
+        m_look.grading.*(f.str) = 0.0f;
+        m_look.grading.*(f.lum) = 0.0f;
+        refreshGradingWidgets();
+        refreshUndoRedoActions();
+        markDirty();
         if (m_debounce) m_debounce->start();
     });
 }
@@ -2543,18 +3758,27 @@ void MainWindow::refreshGradingWidgets()
     for (int i = 0; i < kGradingWheelCount; ++i) {
         const auto& f = kWheels[i];
         auto& w = m_gradingWheels[i];
-        if (!w.hue || !w.sat || !w.str) continue;
+        if (!w.wheel || !w.str || !w.lum) continue;
 
-        const int hueV = static_cast<int>(std::lround(m_look.grading.*(f.hue)));
-        const int satV = static_cast<int>(std::lround(m_look.grading.*(f.sat)));
-        const int strV = static_cast<int>(std::lround(m_look.grading.*(f.str)));
+        const float hueDeg = m_look.grading.*(f.hue);
+        const float satPct = m_look.grading.*(f.sat);
+        const int   strV   = static_cast<int>(std::lround(m_look.grading.*(f.str)));
+        const int   lumV   = static_cast<int>(std::lround(m_look.grading.*(f.lum)));
 
-        { QSignalBlocker b(w.hue); w.hue->setValue(hueV); }
-        if (w.hueValue) w.hueValue->setText(QString::number(hueV));
-        { QSignalBlocker b(w.sat); w.sat->setValue(satV); }
-        if (w.satValue) w.satValue->setText(QString::number(satV));
+        // Wheel takes hue in degrees and sat in [0, 1]. setHueSaturation
+        // does NOT emit signals (programmatic update).
+        w.wheel->setHueSaturation(hueDeg, satPct / 100.0f);
+
+        // Numeric readouts next to the wheel.
+        if (w.hueValue) w.hueValue->setText(
+            QString::number(static_cast<int>(std::lround(hueDeg))) + QStringLiteral("°"));
+        if (w.satValue) w.satValue->setText(
+            QString::number(static_cast<int>(std::lround(satPct))) + QStringLiteral("%"));
+
         { QSignalBlocker b(w.str); w.str->setValue(strV); }
         if (w.strValue) w.strValue->setText(QString::number(strV));
+        { QSignalBlocker b(w.lum); w.lum->setValue(lumV); }
+        if (w.lumValue) w.lumValue->setText(QString::number(lumV));
     }
 
     if (m_balanceSlider) {
@@ -2569,6 +3793,29 @@ void MainWindow::refreshGradingWidgets()
         m_blendingSlider->setValue(v);
         if (m_blendingValue) m_blendingValue->setText(QString::number(v));
     }
+
+    // Advanced grading — V1 placeholders, no engine effect yet.
+    auto refreshIntSlider = [](QSlider* s, QLabel* lbl, float v) {
+        if (!s) return;
+        const int iv = static_cast<int>(std::lround(v));
+        QSignalBlocker b(s);
+        s->setValue(iv);
+        if (lbl) lbl->setText(QString::number(iv));
+    };
+    refreshIntSlider(m_liftSlider,   m_liftValue,   m_look.grading.lift);
+    refreshIntSlider(m_gammaSlider,  m_gammaValue,  m_look.grading.gamma);
+    refreshIntSlider(m_gainSlider,   m_gainValue,   m_look.grading.gain);
+    refreshIntSlider(m_offsetSlider, m_offsetValue, m_look.grading.offset);
+    refreshIntSlider(m_filmicContrastSlider,   m_filmicContrastValue,
+                     m_look.grading.filmicContrast);
+    refreshIntSlider(m_highlightRolloffSlider, m_highlightRolloffValue,
+                     m_look.grading.highlightRolloff);
+    refreshIntSlider(m_shadowLiftSlider,       m_shadowLiftValue,
+                     m_look.grading.shadowLift);
+    refreshIntSlider(m_fadeBlacksSlider,       m_fadeBlacksValue,
+                     m_look.grading.fadeBlacks);
+    refreshIntSlider(m_colorSeparationSlider,  m_colorSeparationValue,
+                     m_look.grading.colorSeparation);
 }
 
 // ==============================================================================

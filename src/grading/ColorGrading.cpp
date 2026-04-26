@@ -232,13 +232,11 @@ void applyThreeWayGrading(PixelBuffer& buffer, const GradingParams& params)
     const float sHi0 = pivotHi - halfW;
     const float sHi1 = pivotHi + halfW;
 
-    ScanlineParallel::run(buffer.height(),
-        [&buffer, tShadows, tMidtones, tHighlights, tGlobal,
-         sLo0, sLo1, sHi0, sHi1](int y0, int y1) {
-        for (int y = y0; y < y1; ++y) {
-            float* row = buffer.row(y);
-            const int W = buffer.width();
-            for (int x = 0; x < W; ++x) {
+    forEachScanline(buffer,
+        [tShadows, tMidtones, tHighlights, tGlobal,
+         sLo0, sLo1, sHi0, sHi1, &buffer](float* row, int /*y*/) {
+        const int W = buffer.width();
+        for (int x = 0; x < W; ++x) {
                 float* p = row + x * 4;
 
                 // Luminance — Rec.709 linear, same convention as the rest
@@ -283,7 +281,6 @@ void applyThreeWayGrading(PixelBuffer& buffer, const GradingParams& params)
                 p[1] = g;
                 p[2] = b;
                 // alpha p[3] untouched
-            }
         }
     });
 }
@@ -303,7 +300,11 @@ void ColorGrading::apply(PixelBuffer& buffer, const GradingParams& params)
         }
     }
 
-    if (!params.lutPath.isEmpty() && params.lutOpacity > 1e-3f) {
+    // LUT branch — gated by lutEnabled so users can temporarily bypass
+    // a loaded LUT without losing their opacity setting. The path/opacity
+    // pre-checks remain to fast-path skip when the LUT field is unset
+    // or fully transparent.
+    if (params.lutEnabled && !params.lutPath.isEmpty() && params.lutOpacity > 1e-3f) {
         if (const LUTData* lut = fetchLut(params.lutPath))
             applyLut(buffer, *lut, params.lutOpacity);
     }

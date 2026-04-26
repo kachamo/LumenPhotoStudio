@@ -213,6 +213,7 @@ QJsonObject LookSerializer::toJson(const Look& look)
         QJsonObject g;
         g["lutPath"]            = look.grading.lutPath;
         g["lutOpacity"]         = look.grading.lutOpacity;
+        g["lutEnabled"]         = look.grading.lutEnabled;
         g["filmProfileId"]      = look.grading.filmProfileId;
         g["filmProfileOpacity"] = look.grading.filmProfileOpacity;
 
@@ -222,17 +223,34 @@ QJsonObject LookSerializer::toJson(const Look& look)
         g["shadowsHue"]          = look.grading.shadowsHue;
         g["shadowsSaturation"]   = look.grading.shadowsSaturation;
         g["shadowsStrength"]     = look.grading.shadowsStrength;
+        g["shadowsLuminance"]    = look.grading.shadowsLuminance;
         g["midtonesHue"]         = look.grading.midtonesHue;
         g["midtonesSaturation"]  = look.grading.midtonesSaturation;
         g["midtonesStrength"]    = look.grading.midtonesStrength;
+        g["midtonesLuminance"]   = look.grading.midtonesLuminance;
         g["highlightsHue"]       = look.grading.highlightsHue;
         g["highlightsSaturation"] = look.grading.highlightsSaturation;
         g["highlightsStrength"]  = look.grading.highlightsStrength;
+        g["highlightsLuminance"] = look.grading.highlightsLuminance;
         g["globalHue"]           = look.grading.globalHue;
         g["globalSaturation"]    = look.grading.globalSaturation;
         g["globalStrength"]      = look.grading.globalStrength;
+        g["globalLuminance"]     = look.grading.globalLuminance;
         g["balance"]             = look.grading.balance;
         g["blending"]            = look.grading.blending;
+
+        // Advanced grading + filmic look — V1 placeholders. Persist so
+        // projects authored now pick up rendering when the engine math
+        // lands.
+        g["lift"]             = look.grading.lift;
+        g["gamma"]            = look.grading.gamma;
+        g["gain"]             = look.grading.gain;
+        g["offset"]           = look.grading.offset;
+        g["filmicContrast"]   = look.grading.filmicContrast;
+        g["highlightRolloff"] = look.grading.highlightRolloff;
+        g["shadowLift"]       = look.grading.shadowLift;
+        g["fadeBlacks"]       = look.grading.fadeBlacks;
+        g["colorSeparation"]  = look.grading.colorSeparation;
 
         root["grading"] = g;
     }
@@ -254,6 +272,91 @@ QJsonObject LookSerializer::toJson(const Look& look)
         cl["amount"] = look.effects.clarity.amount;
         e["clarity"] = cl;
         root["effects"] = e;
+    }
+
+    // Local adjustments — array of mask objects. Each mask serializes as
+    // a flat-keys JSON object with all geometry fields present (unused
+    // fields per type are still written for forward-compat — cheap, and
+    // makes the JSON readable to humans). Type is stored as int so the
+    // file format is robust to future enum reordering (we'd map old
+    // int values to new on deserialize if that ever happens).
+    {
+        QJsonArray arr;
+        for (const auto& la : look.localAdjustments) {
+            QJsonObject m;
+            m["name"]    = la.name;
+            m["enabled"] = la.enabled;
+            m["type"]    = static_cast<int>(la.type);
+
+            // Geometry — fields used per type, but we save all so the
+            // file is forward-compatible if a user switches a mask's
+            // type later (old field values stick around as defaults).
+            QJsonArray sp;     sp << la.startPoint.x() << la.startPoint.y();
+            QJsonArray ep;     ep << la.endPoint.x()   << la.endPoint.y();
+            QJsonArray ctr;    ctr << la.center.x()    << la.center.y();
+            m["startPoint"] = sp;
+            m["endPoint"]   = ep;
+            m["center"]     = ctr;
+            m["radius"]     = la.radius;
+            m["feather"]    = la.feather;
+            m["invert"]     = la.invert;
+            m["density"]    = la.density;
+            m["flow"]       = la.flow;
+
+            // Brush stamps — array of [x, y] pairs. V1 doesn't paint, so
+            // this is empty by default; serializing it preserves whatever
+            // future versions write here.
+            QJsonArray stamps;
+            for (const QPointF& s : la.brushStamps) {
+                QJsonArray pt;
+                pt << s.x() << s.y();
+                stamps.append(pt);
+            }
+            m["brushStamps"] = stamps;
+
+            // Adjustment values — flat keys.
+            m["exposure"]    = la.exposure;
+            m["brightness"]  = la.brightness;
+            m["contrast"]    = la.contrast;
+            m["saturation"]  = la.saturation;
+            m["temperature"] = la.temperature;
+            m["tint"]        = la.tint;
+
+            arr.append(m);
+        }
+        root["localAdjustments"] = arr;
+    }
+
+    // Adjustment layers — array of layer objects. Each carries a flat
+    // LayerAdjustmentData payload (Tone + Color + Curves + Grading +
+    // Effects, NOT a recursive Look) plus compositing controls. We
+    // route the payload through a temporary Look so we can reuse the
+    // existing per-sub-struct serialization code without duplication.
+    // The temporary Look's localAdjustments / adjustmentLayers / name /
+    // schemaVersion fields stay default and get ignored on the read side.
+    {
+        QJsonArray arr;
+        for (const auto& al : look.adjustmentLayers) {
+            QJsonObject layer;
+            layer["name"]       = al.name;
+            layer["enabled"]    = al.enabled;
+            layer["opacity"]    = al.opacity;
+            layer["blendMode"]  = static_cast<int>(al.blendMode);
+            layer["maskRef"]    = al.maskRef;
+
+            // Bridge through a temporary Look so the existing toJson()
+            // sub-tree code applies. Only the five sub-structs are read
+            // back on the deserialize side.
+            Look tmp;
+            tmp.tone    = al.adjustmentData.tone;
+            tmp.color   = al.adjustmentData.color;
+            tmp.curves  = al.adjustmentData.curves;
+            tmp.grading = al.adjustmentData.grading;
+            tmp.effects = al.adjustmentData.effects;
+            layer["adjustmentData"] = LookSerializer::toJson(tmp);
+            arr.append(layer);
+        }
+        root["adjustmentLayers"] = arr;
     }
 
     return root;
@@ -341,29 +444,49 @@ bool LookSerializer::fromJson(const QJsonObject& obj, Look& out, QString* errorO
         const QJsonObject g = readObject(obj, "grading");
         out.grading.lutPath            = readString(g, "lutPath");
         out.grading.lutOpacity         = readFloat(g, "lutOpacity", 1.0f);
+        // Older files (no lutEnabled key) default to true so a saved LUT
+        // path keeps applying — matches V0 behavior.
+        out.grading.lutEnabled         = g.value("lutEnabled").toBool(true);
         out.grading.filmProfileId      = readString(g, "filmProfileId");
         out.grading.filmProfileOpacity = readFloat(g, "filmProfileOpacity", 1.0f);
 
         // 3-way color wheels. Defaults match the struct: 0 hue, 0 sat, 0
-        // strength. Older preset files (no wheels saved) deserialize as
-        // identity, which is the right behavior — they round-trip
-        // unchanged.
+        // strength, 0 luminance. Older preset files (no wheels saved)
+        // deserialize as identity, which is the right behavior — they
+        // round-trip unchanged. Luminance fields landed in V2; older
+        // files without them default to 0.
         out.grading.shadowsHue           = readFloat(g, "shadowsHue",           0.0f);
         out.grading.shadowsSaturation    = readFloat(g, "shadowsSaturation",    0.0f);
         out.grading.shadowsStrength      = readFloat(g, "shadowsStrength",      0.0f);
+        out.grading.shadowsLuminance     = readFloat(g, "shadowsLuminance",     0.0f);
         out.grading.midtonesHue          = readFloat(g, "midtonesHue",          0.0f);
         out.grading.midtonesSaturation   = readFloat(g, "midtonesSaturation",   0.0f);
         out.grading.midtonesStrength     = readFloat(g, "midtonesStrength",     0.0f);
+        out.grading.midtonesLuminance    = readFloat(g, "midtonesLuminance",    0.0f);
         out.grading.highlightsHue        = readFloat(g, "highlightsHue",        0.0f);
         out.grading.highlightsSaturation = readFloat(g, "highlightsSaturation", 0.0f);
         out.grading.highlightsStrength   = readFloat(g, "highlightsStrength",   0.0f);
+        out.grading.highlightsLuminance  = readFloat(g, "highlightsLuminance",  0.0f);
         out.grading.globalHue            = readFloat(g, "globalHue",            0.0f);
         out.grading.globalSaturation     = readFloat(g, "globalSaturation",     0.0f);
         out.grading.globalStrength       = readFloat(g, "globalStrength",       0.0f);
+        out.grading.globalLuminance      = readFloat(g, "globalLuminance",      0.0f);
         out.grading.balance              = readFloat(g, "balance",              0.0f);
         // blending defaults to 50 (medium softness) when absent — matches
         // the struct default.
         out.grading.blending             = readFloat(g, "blending",             50.0f);
+
+        // Advanced + filmic placeholders. Default to 0 (identity) when
+        // missing.
+        out.grading.lift             = readFloat(g, "lift",             0.0f);
+        out.grading.gamma            = readFloat(g, "gamma",            0.0f);
+        out.grading.gain             = readFloat(g, "gain",             0.0f);
+        out.grading.offset           = readFloat(g, "offset",           0.0f);
+        out.grading.filmicContrast   = readFloat(g, "filmicContrast",   0.0f);
+        out.grading.highlightRolloff = readFloat(g, "highlightRolloff", 0.0f);
+        out.grading.shadowLift       = readFloat(g, "shadowLift",       0.0f);
+        out.grading.fadeBlacks       = readFloat(g, "fadeBlacks",       0.0f);
+        out.grading.colorSeparation  = readFloat(g, "colorSeparation",  0.0f);
     }
 
     // ---- Effects
@@ -382,6 +505,122 @@ bool LookSerializer::fromJson(const QJsonObject& obj, Look& out, QString* errorO
 
         const QJsonObject cl = readObject(e, "clarity");
         out.effects.clarity.amount = readFloat(cl, "amount", 0.0f);
+    }
+
+    // Local adjustments — array of mask objects. Defensive: missing fields
+    // default to neutral, unknown enum values clamp to LinearGradient,
+    // truncated arrays parse as the points they have. Empty array (or
+    // missing key) is the V0 case — older files predate masks and are
+    // valid as zero-mask Looks.
+    {
+        const QJsonArray arr = readArray(obj, "localAdjustments");
+        out.localAdjustments.clear();
+        out.localAdjustments.reserve(static_cast<size_t>(arr.size()));
+        for (const QJsonValue& v : arr) {
+            if (!v.isObject()) continue;
+            const QJsonObject m = v.toObject();
+            LocalAdjustment la;
+            la.name    = readString(m, "name");
+            la.enabled = m.value("enabled").toBool(true);
+
+            // Type: clamp out-of-range int values to LinearGradient so a
+            // hand-edited or future-version file can't crash us with an
+            // enum reordering.
+            const int typeInt = readInt(m, "type",
+                                        static_cast<int>(MaskType::LinearGradient));
+            switch (typeInt) {
+                case 0: la.type = MaskType::Brush;          break;
+                case 2: la.type = MaskType::RadialGradient; break;
+                case 1:
+                default: la.type = MaskType::LinearGradient; break;
+            }
+
+            // Geometry — read [x, y] arrays. Missing/short arrays leave
+            // the field at its struct-default value.
+            auto readPoint = [&](const QString& key, QPointF& out) {
+                const QJsonArray a = readArray(m, key);
+                if (a.size() >= 2) out = QPointF(a[0].toDouble(out.x()),
+                                                  a[1].toDouble(out.y()));
+            };
+            readPoint("startPoint", la.startPoint);
+            readPoint("endPoint",   la.endPoint);
+            readPoint("center",     la.center);
+            la.radius  = readFloat(m, "radius",  la.radius);
+            la.feather = readFloat(m, "feather", la.feather);
+            // V2 fields — older files default to false/1.0 (identity for
+            // these modifiers, matching pre-V2 engine behavior).
+            la.invert  = m.value("invert").toBool(false);
+            la.density = readFloat(m, "density", 1.0f);
+            la.flow    = readFloat(m, "flow",    1.0f);
+
+            // Brush stamps.
+            la.brushStamps.clear();
+            const QJsonArray stamps = readArray(m, "brushStamps");
+            la.brushStamps.reserve(stamps.size());
+            for (const QJsonValue& sv : stamps) {
+                const QJsonArray pa = sv.toArray();
+                if (pa.size() >= 2) {
+                    la.brushStamps.append(QPointF(pa[0].toDouble(),
+                                                   pa[1].toDouble()));
+                }
+            }
+
+            la.exposure    = readFloat(m, "exposure",    0.0f);
+            la.brightness  = readFloat(m, "brightness",  0.0f);
+            la.contrast    = readFloat(m, "contrast",    0.0f);
+            la.saturation  = readFloat(m, "saturation",  0.0f);
+            la.temperature = readFloat(m, "temperature", 0.0f);
+            la.tint        = readFloat(m, "tint",        0.0f);
+
+            out.localAdjustments.push_back(std::move(la));
+        }
+    }
+
+    // Adjustment layers — array of layer objects, each carrying a flat
+    // LayerAdjustmentData payload (NOT a recursive Look). Defensive:
+    // missing fields default to neutral, unknown blend modes clamp to
+    // Normal, missing adjustmentData becomes an identity payload.
+    //
+    // We bridge through a temporary Look on read so the existing
+    // fromJson() sub-tree code applies. Only the five sub-structs are
+    // copied out — the temp's localAdjustments / adjustmentLayers /
+    // name / schemaVersion are intentionally discarded.
+    {
+        const QJsonArray arr = readArray(obj, "adjustmentLayers");
+        out.adjustmentLayers.clear();
+        out.adjustmentLayers.reserve(static_cast<size_t>(arr.size()));
+        for (const QJsonValue& v : arr) {
+            if (!v.isObject()) continue;
+            const QJsonObject lo = v.toObject();
+            AdjustmentLayer al;
+            al.name    = readString(lo, "name");
+            al.enabled = lo.value("enabled").toBool(true);
+            al.opacity = readFloat(lo, "opacity", 1.0f);
+            const int bmInt = readInt(lo, "blendMode",
+                                      static_cast<int>(BlendMode::Normal));
+            // Clamp out-of-range blend mode ints to Normal so future
+            // values don't crash. The known range is 0..10 in V1.
+            if (bmInt < 0 || bmInt > 10) {
+                al.blendMode = BlendMode::Normal;
+            } else {
+                al.blendMode = static_cast<BlendMode>(bmInt);
+            }
+            al.maskRef = readString(lo, "maskRef");
+
+            // Read into a temporary Look, then copy the five sub-structs
+            // into the flat payload. fromJson is defensively parsed —
+            // missing keys produce identity values.
+            const QJsonObject inner = readObject(lo, "adjustmentData");
+            Look tmp;
+            LookSerializer::fromJson(inner, tmp, nullptr);
+            al.adjustmentData.tone    = tmp.tone;
+            al.adjustmentData.color   = tmp.color;
+            al.adjustmentData.curves  = tmp.curves;
+            al.adjustmentData.grading = tmp.grading;
+            al.adjustmentData.effects = tmp.effects;
+
+            out.adjustmentLayers.push_back(std::move(al));
+        }
     }
 
     // Final safety: enforce documented ranges so corrupt files can't damage
