@@ -64,10 +64,13 @@ public:
     // stages). The returned image is always sRGB-encoded.
     enum class Stage {
         Input,
+        AfterLens,
+        AfterTransform,
         AfterTone,
         AfterColor,
         AfterCurve,
         AfterGrading,
+        AfterDetails,
         AfterEffects,
     };
     RenderResult renderUpTo(const QImage& input, Look look, Stage stage) const;

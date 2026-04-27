@@ -72,8 +72,66 @@ inline float maskWeightRadial(const QPointF& p,
     return 1.0f - math::smoothstep(innerFrac, 1.0f, d);
 }
 
-// Dispatch by mask type. Brush is V1-placeholder (always 0). aspectRatio
-// is only used by radial; pass any value for linear/brush.
+inline float brushDistanceShortEdge(const QPointF& a,
+                                    const QPointF& b,
+                                    float aspectRatio)
+{
+    const double dx = a.x() - b.x();
+    const double dy = a.y() - b.y();
+    if (aspectRatio >= 1.0f) {
+        return static_cast<float>(std::sqrt((dx * aspectRatio) * (dx * aspectRatio)
+                                            + dy * dy));
+    }
+    if (aspectRatio > 1e-4f) {
+        return static_cast<float>(std::sqrt(dx * dx
+                                            + (dy / aspectRatio) * (dy / aspectRatio)));
+    }
+    return static_cast<float>(std::sqrt(dx * dx + dy * dy));
+}
+
+inline float brushStampWeight(const QPointF& p,
+                              const QPointF& center,
+                              float diameter,
+                              float feather,
+                              float aspectRatio)
+{
+    const float radius = std::max(0.0005f, diameter * 0.5f);
+    const float d = brushDistanceShortEdge(p, center, aspectRatio) / radius;
+    if (d >= 1.0f) return 0.0f;
+
+    const float f = std::clamp(feather, 0.0f, 1.0f);
+    if (f <= 1e-4f) return 1.0f;
+    const float inner = 1.0f - f;
+    return 1.0f - math::smoothstep(inner, 1.0f, d);
+}
+
+inline float maskWeightBrush(const QPointF& p,
+                             const LocalAdjustment& mask,
+                             float aspectRatio)
+{
+    float w = 0.0f;
+    for (const BrushStroke& stroke : mask.brushStrokes) {
+        const float flow = std::clamp(stroke.flow, 0.0f, 1.0f);
+        if (flow <= 1e-4f) continue;
+
+        const float targetDensity = std::clamp(stroke.density, 0.0f, 1.0f);
+        for (const QPointF& stamp : stroke.points) {
+            const float s = brushStampWeight(p, stamp, stroke.size,
+                                             stroke.feather, aspectRatio);
+            if (s <= 1e-4f) continue;
+            const float amount = std::clamp(s * flow, 0.0f, 1.0f);
+            if (stroke.erase) {
+                w *= (1.0f - amount);
+            } else {
+                w += amount * (targetDensity - w);
+            }
+            w = std::clamp(w, 0.0f, 1.0f);
+        }
+    }
+    return w;
+}
+
+// Dispatch by mask type. aspectRatio is imageWidth / imageHeight.
 inline float maskWeight(const QPointF& p,
                         const LocalAdjustment& mask,
                         float aspectRatio)
@@ -81,7 +139,7 @@ inline float maskWeight(const QPointF& p,
     switch (mask.type) {
         case MaskType::LinearGradient: return maskWeightLinear(p, mask);
         case MaskType::RadialGradient: return maskWeightRadial(p, mask, aspectRatio);
-        case MaskType::Brush:          return 0.0f;
+        case MaskType::Brush:          return maskWeightBrush(p, mask, aspectRatio);
     }
     return 0.0f;
 }

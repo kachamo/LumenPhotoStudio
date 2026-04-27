@@ -11,5 +11,7 @@
         <file alias="sidebar/mask.svg">icons/sidebar/mask.svg</file>
         <file alias="sidebar/presets.svg">icons/sidebar/presets.svg</file>
         <file alias="sidebar/plugins.svg">icons/sidebar/plugins.svg</file>
+        <file alias="sidebar/nodes.svg">icons/sidebar/nodes.svg</file>
+        <file alias="sidebar/lens.svg">icons/sidebar/lens.svg</file>
     </qresource>
 </RCC>

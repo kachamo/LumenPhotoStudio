@@ -29,6 +29,7 @@
 #include <QObject>
 
 #include <cmath>
+#include <utility>
 
 namespace lps {
 
@@ -155,6 +156,18 @@ QJsonObject LookSerializer::toJson(const Look& look)
     root["name"] = look.name;
     root["schemaVersion"] = kCurrentSchemaVersion;
 
+    // HDR tone mapping
+    {
+        QJsonObject h;
+        h["enabled"]              = look.hdr.enabled;
+        h["exposureBias"]         = look.hdr.exposureBias;
+        h["highlightCompression"] = look.hdr.highlightCompression;
+        h["shoulderStrength"]     = look.hdr.shoulderStrength;
+        h["midtonePivot"]         = look.hdr.midtonePivot;
+        h["saturationPreserve"]   = look.hdr.saturationPreserve;
+        root["hdr"] = h;
+    }
+
     // Tone
     {
         QJsonObject t;
@@ -255,6 +268,20 @@ QJsonObject LookSerializer::toJson(const Look& look)
         root["grading"] = g;
     }
 
+    // Details
+    {
+        QJsonObject d;
+        d["sharpeningAmount"]  = look.details.sharpeningAmount;
+        d["sharpeningRadius"]  = look.details.sharpeningRadius;
+        d["sharpeningDetail"]  = look.details.sharpeningDetail;
+        d["sharpeningMasking"] = look.details.sharpeningMasking;
+        d["luminanceNR"]       = look.details.luminanceNR;
+        d["luminanceDetail"]   = look.details.luminanceDetail;
+        d["colorNR"]           = look.details.colorNR;
+        d["colorDetail"]       = look.details.colorDetail;
+        root["details"] = d;
+    }
+
     // Effects
     {
         QJsonObject e;
@@ -272,6 +299,38 @@ QJsonObject LookSerializer::toJson(const Look& look)
         cl["amount"] = look.effects.clarity.amount;
         e["clarity"] = cl;
         root["effects"] = e;
+    }
+
+    // Lens correction — flat sub-object with the six fields. enabled is
+    // a master kill switch; all other fields persist so toggling enabled
+    // off and back on returns the user to their authored values.
+    {
+        QJsonObject l;
+        l["enabled"]                   = look.lens.enabled;
+        l["removeChromaticAberration"] = look.lens.removeChromaticAberration;
+        l["distortion"]                = look.lens.distortion;
+        l["vignetting"]                = look.lens.vignetting;
+        l["purpleFringe"]              = look.lens.purpleFringe;
+        l["greenFringe"]               = look.lens.greenFringe;
+        root["lens"] = l;
+    }
+
+    // Transform
+    {
+        QJsonObject t;
+        t["rotationDegrees"] = look.transform.rotationDegrees;
+        t["flipHorizontal"]  = look.transform.flipHorizontal;
+        t["flipVertical"]    = look.transform.flipVertical;
+        t["straightenAngle"] = look.transform.straightenAngle;
+
+        QJsonObject crop;
+        crop["x"]      = look.transform.cropRect.x();
+        crop["y"]      = look.transform.cropRect.y();
+        crop["width"]  = look.transform.cropRect.width();
+        crop["height"] = look.transform.cropRect.height();
+        t["cropRect"] = crop;
+
+        root["transform"] = t;
     }
 
     // Local adjustments — array of mask objects. Each mask serializes as
@@ -302,17 +361,30 @@ QJsonObject LookSerializer::toJson(const Look& look)
             m["invert"]     = la.invert;
             m["density"]    = la.density;
             m["flow"]       = la.flow;
+            m["brushSize"]      = la.brushSize;
+            m["brushEraseMode"] = la.brushEraseMode;
 
             // Brush stamps — array of [x, y] pairs. V1 doesn't paint, so
             // this is empty by default; serializing it preserves whatever
             // future versions write here.
-            QJsonArray stamps;
-            for (const QPointF& s : la.brushStamps) {
-                QJsonArray pt;
-                pt << s.x() << s.y();
-                stamps.append(pt);
+            QJsonArray strokes;
+            for (const BrushStroke& stroke : la.brushStrokes) {
+                QJsonObject st;
+                st["size"]    = stroke.size;
+                st["feather"] = stroke.feather;
+                st["flow"]    = stroke.flow;
+                st["density"] = stroke.density;
+                st["erase"]   = stroke.erase;
+                QJsonArray points;
+                for (const QPointF& p : stroke.points) {
+                    QJsonArray pt;
+                    pt << p.x() << p.y();
+                    points.append(pt);
+                }
+                st["points"] = points;
+                strokes.append(st);
             }
-            m["brushStamps"] = stamps;
+            m["brushStrokes"] = strokes;
 
             // Adjustment values — flat keys.
             m["exposure"]    = la.exposure;
@@ -375,6 +447,17 @@ bool LookSerializer::fromJson(const QJsonObject& obj, Look& out, QString* errorO
 
     // Future migrations go here. For now we have only v1.
     // if (out.schemaVersion == 0) { migrateV0toV1(obj); }
+
+    // ---- HDR tone mapping
+    {
+        const QJsonObject h = readObject(obj, "hdr");
+        out.hdr.enabled              = h.value("enabled").toBool(false);
+        out.hdr.exposureBias         = readFloat(h, "exposureBias",         0.0f);
+        out.hdr.highlightCompression = readFloat(h, "highlightCompression", 50.0f);
+        out.hdr.shoulderStrength     = readFloat(h, "shoulderStrength",     50.0f);
+        out.hdr.midtonePivot         = readFloat(h, "midtonePivot",         0.18f);
+        out.hdr.saturationPreserve   = readFloat(h, "saturationPreserve",   85.0f);
+    }
 
     // ---- Tone
     {
@@ -489,6 +572,19 @@ bool LookSerializer::fromJson(const QJsonObject& obj, Look& out, QString* errorO
         out.grading.colorSeparation  = readFloat(g, "colorSeparation",  0.0f);
     }
 
+    // ---- Details
+    {
+        const QJsonObject d = readObject(obj, "details");
+        out.details.sharpeningAmount  = readFloat(d, "sharpeningAmount",  0.0f);
+        out.details.sharpeningRadius  = readFloat(d, "sharpeningRadius",  1.0f);
+        out.details.sharpeningDetail  = readFloat(d, "sharpeningDetail",  0.0f);
+        out.details.sharpeningMasking = readFloat(d, "sharpeningMasking", 0.0f);
+        out.details.luminanceNR       = readFloat(d, "luminanceNR",       0.0f);
+        out.details.luminanceDetail   = readFloat(d, "luminanceDetail",   0.0f);
+        out.details.colorNR           = readFloat(d, "colorNR",           0.0f);
+        out.details.colorDetail       = readFloat(d, "colorDetail",       0.0f);
+    }
+
     // ---- Effects
     {
         const QJsonObject e = readObject(obj, "effects");
@@ -505,6 +601,36 @@ bool LookSerializer::fromJson(const QJsonObject& obj, Look& out, QString* errorO
 
         const QJsonObject cl = readObject(e, "clarity");
         out.effects.clarity.amount = readFloat(cl, "amount", 0.0f);
+    }
+
+    // ---- Lens correction
+    // V2 fields — older files (no "lens" key) parse as defaults (all
+    // zero, enabled=false), which is identity at the engine level. So
+    // pre-lens projects load cleanly with lens correction inert.
+    {
+        const QJsonObject l = readObject(obj, "lens");
+        out.lens.enabled                   = l.value("enabled").toBool(false);
+        out.lens.removeChromaticAberration =
+            l.value("removeChromaticAberration").toBool(false);
+        out.lens.distortion   = readFloat(l, "distortion",   0.0f);
+        out.lens.vignetting   = readFloat(l, "vignetting",   0.0f);
+        out.lens.purpleFringe = readFloat(l, "purpleFringe", 0.0f);
+        out.lens.greenFringe  = readFloat(l, "greenFringe",  0.0f);
+    }
+
+    // ---- Transform
+    {
+        const QJsonObject t = readObject(obj, "transform");
+        out.transform.rotationDegrees = readFloat(t, "rotationDegrees", 0.0f);
+        out.transform.flipHorizontal  = t.value("flipHorizontal").toBool(false);
+        out.transform.flipVertical    = t.value("flipVertical").toBool(false);
+        out.transform.straightenAngle = readFloat(t, "straightenAngle", 0.0f);
+
+        const QJsonObject crop = readObject(t, "cropRect");
+        out.transform.cropRect = QRectF(readFloat(crop, "x",      0.0f),
+                                        readFloat(crop, "y",      0.0f),
+                                        readFloat(crop, "width",  1.0f),
+                                        readFloat(crop, "height", 1.0f));
     }
 
     // Local adjustments — array of mask objects. Defensive: missing fields
@@ -552,16 +678,52 @@ bool LookSerializer::fromJson(const QJsonObject& obj, Look& out, QString* errorO
             la.invert  = m.value("invert").toBool(false);
             la.density = readFloat(m, "density", 1.0f);
             la.flow    = readFloat(m, "flow",    1.0f);
+            la.brushSize      = readFloat(m, "brushSize", la.brushSize);
+            la.brushEraseMode = m.value("brushEraseMode").toBool(false);
 
             // Brush stamps.
-            la.brushStamps.clear();
-            const QJsonArray stamps = readArray(m, "brushStamps");
-            la.brushStamps.reserve(stamps.size());
-            for (const QJsonValue& sv : stamps) {
-                const QJsonArray pa = sv.toArray();
-                if (pa.size() >= 2) {
-                    la.brushStamps.append(QPointF(pa[0].toDouble(),
-                                                   pa[1].toDouble()));
+            la.brushStrokes.clear();
+            const QJsonArray strokes = readArray(m, "brushStrokes");
+            la.brushStrokes.reserve(strokes.size());
+            for (const QJsonValue& sv : strokes) {
+                if (!sv.isObject()) continue;
+                const QJsonObject so = sv.toObject();
+                BrushStroke stroke;
+                stroke.size    = readFloat(so, "size",    la.brushSize);
+                stroke.feather = readFloat(so, "feather", la.feather);
+                stroke.flow    = readFloat(so, "flow",    la.flow);
+                stroke.density = readFloat(so, "density", la.density);
+                stroke.erase   = so.value("erase").toBool(false);
+                const QJsonArray points = readArray(so, "points");
+                stroke.points.reserve(points.size());
+                for (const QJsonValue& pv : points) {
+                    const QJsonArray pa = pv.toArray();
+                    if (pa.size() >= 2) {
+                        stroke.points.append(QPointF(pa[0].toDouble(),
+                                                     pa[1].toDouble()));
+                    }
+                }
+                if (!stroke.points.isEmpty())
+                    la.brushStrokes.append(stroke);
+            }
+            if (la.brushStrokes.isEmpty()) {
+                const QJsonArray stamps = readArray(m, "brushStamps");
+                if (!stamps.isEmpty()) {
+                    BrushStroke stroke;
+                    stroke.size    = la.brushSize;
+                    stroke.feather = la.feather;
+                    stroke.flow    = la.flow;
+                    stroke.density = la.density;
+                    stroke.points.reserve(stamps.size());
+                    for (const QJsonValue& sv : stamps) {
+                        const QJsonArray pa = sv.toArray();
+                        if (pa.size() >= 2) {
+                            stroke.points.append(QPointF(pa[0].toDouble(),
+                                                         pa[1].toDouble()));
+                        }
+                    }
+                    if (!stroke.points.isEmpty())
+                        la.brushStrokes.append(stroke);
                 }
             }
 

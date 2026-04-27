@@ -20,6 +20,26 @@ namespace lps {
 using math::clamp;
 using math::nearZero;
 
+// ---- HDR --------------------------------------------------------------------
+bool HDRParams::isIdentity() const
+{
+    return !enabled;
+}
+
+void HDRParams::clampRanges()
+{
+    exposureBias         = clamp(exposureBias,         -5.0f,  +5.0f);
+    highlightCompression = clamp(highlightCompression,  0.0f, 100.0f);
+    shoulderStrength     = clamp(shoulderStrength,      0.0f, 100.0f);
+    midtonePivot         = clamp(midtonePivot,          0.05f,  1.0f);
+    saturationPreserve   = clamp(saturationPreserve,    0.0f, 100.0f);
+}
+
+void HDRParams::reset()
+{
+    *this = HDRParams{};
+}
+
 // ---- Tone -------------------------------------------------------------------
 bool ToneParams::isIdentity() const
 {
@@ -239,6 +259,74 @@ void GradingParams::clampRanges()
     colorSeparation  = clamp(colorSeparation,  -100.0f, 100.0f);
 }
 
+// ---- Details ----------------------------------------------------------------
+bool DetailsParams::isIdentity() const
+{
+    return sharpeningAmount <= 1e-4f
+        && luminanceNR      <= 1e-4f
+        && colorNR          <= 1e-4f;
+}
+
+void DetailsParams::clampRanges()
+{
+    sharpeningAmount  = clamp(sharpeningAmount,    0.0f, 150.0f);
+    sharpeningRadius  = clamp(sharpeningRadius,    0.5f,   3.0f);
+    sharpeningDetail  = clamp(sharpeningDetail,    0.0f, 100.0f);
+    sharpeningMasking = clamp(sharpeningMasking,   0.0f, 100.0f);
+
+    luminanceNR     = clamp(luminanceNR,     0.0f, 100.0f);
+    luminanceDetail = clamp(luminanceDetail, 0.0f, 100.0f);
+
+    colorNR     = clamp(colorNR,     0.0f, 100.0f);
+    colorDetail = clamp(colorDetail, 0.0f, 100.0f);
+}
+
+void DetailsParams::reset()
+{
+    *this = DetailsParams{};
+}
+
+// ---- Transform --------------------------------------------------------------
+bool TransformParams::isIdentity() const
+{
+    const QRectF r = cropRect.normalized();
+    const bool cropIdentity =
+        nearZero(static_cast<float>(r.x()))
+        && nearZero(static_cast<float>(r.y()))
+        && nearZero(static_cast<float>(r.width()  - 1.0))
+        && nearZero(static_cast<float>(r.height() - 1.0));
+
+    return nearZero(rotationDegrees)
+        && !flipHorizontal
+        && !flipVertical
+        && nearZero(straightenAngle)
+        && cropIdentity;
+}
+
+void TransformParams::clampRanges()
+{
+    rotationDegrees = std::fmod(rotationDegrees, 360.0f);
+    if (rotationDegrees <= -180.0f) rotationDegrees += 360.0f;
+    if (rotationDegrees >   180.0f) rotationDegrees -= 360.0f;
+
+    straightenAngle = clamp(straightenAngle, -10.0f, 10.0f);
+
+    QRectF r = cropRect.normalized();
+    constexpr float kMinCrop = 1e-4f;
+    const float x = clamp(static_cast<float>(r.x()), 0.0f, 1.0f - kMinCrop);
+    const float y = clamp(static_cast<float>(r.y()), 0.0f, 1.0f - kMinCrop);
+    const float maxW = std::max(kMinCrop, 1.0f - x);
+    const float maxH = std::max(kMinCrop, 1.0f - y);
+    const float w = clamp(static_cast<float>(r.width()),  kMinCrop, maxW);
+    const float h = clamp(static_cast<float>(r.height()), kMinCrop, maxH);
+    cropRect = QRectF(x, y, w, h);
+}
+
+void TransformParams::reset()
+{
+    *this = TransformParams{};
+}
+
 // ---- Effects ----------------------------------------------------------------
 bool VignetteParams::isIdentity() const { return nearZero(amount); }
 
@@ -310,7 +398,18 @@ void LocalAdjustment::clampRanges()
     feather = clamp(feather, 0.0f,  1.0f);
     density = clamp(density, 0.0f,  1.0f);
     flow    = clamp(flow,    0.0f,  1.0f);
+    brushSize = clamp(brushSize, 0.001f, 1.0f);
     // invert is bool; nothing to clamp.
+    for (BrushStroke& stroke : brushStrokes) {
+        stroke.size    = clamp(stroke.size,    0.001f, 1.0f);
+        stroke.feather = clamp(stroke.feather, 0.0f,   1.0f);
+        stroke.flow    = clamp(stroke.flow,    0.0f,   1.0f);
+        stroke.density = clamp(stroke.density, 0.0f,   1.0f);
+        for (QPointF& p : stroke.points) {
+            p.setX(clamp(static_cast<float>(p.x()), -10.0f, 10.0f));
+            p.setY(clamp(static_cast<float>(p.y()), -10.0f, 10.0f));
+        }
+    }
 
     exposure    = clamp(exposure,    -10.0f, +10.0f);
     brightness  = clamp(brightness,  -100.0f, +100.0f);
@@ -364,14 +463,44 @@ void AdjustmentLayer::clampRanges()
     // clamped at deserialize time, not here.
 }
 
+// ---- LensParams -------------------------------------------------------------
+// A LensParams is "identity" (skippable) when disabled, OR enabled but
+// every parameter is at its no-effect default. The engine uses this for
+// fast-path early-return.
+bool LensParams::isIdentity() const
+{
+    if (!enabled) return true;
+    return nearZero(distortion)   && nearZero(vignetting)
+        && nearZero(purpleFringe) && nearZero(greenFringe)
+        && !removeChromaticAberration;
+}
+
+void LensParams::clampRanges()
+{
+    distortion   = clamp(distortion,   -100.0f, +100.0f);
+    vignetting   = clamp(vignetting,   -100.0f, +100.0f);
+    purpleFringe = clamp(purpleFringe,    0.0f, +100.0f);
+    greenFringe  = clamp(greenFringe,     0.0f, +100.0f);
+    // enabled / removeChromaticAberration are bool; nothing to clamp.
+}
+
+void LensParams::reset()
+{
+    *this = LensParams{};
+}
+
 // ---- Look -------------------------------------------------------------------
 bool Look::isIdentity() const
 {
+    if (!hdr.isIdentity())     return false;
     if (!tone.isIdentity())    return false;
     if (!color.isIdentity())   return false;
     if (!curves.isIdentity())  return false;
     if (!grading.isIdentity()) return false;
+    if (!details.isIdentity()) return false;
     if (!effects.isIdentity()) return false;
+    if (!lens.isIdentity())    return false;
+    if (!transform.isIdentity()) return false;
     // Any active local adjustment makes the Look non-identity.
     for (const auto& la : localAdjustments) {
         if (!la.isIdentity()) return false;
@@ -385,11 +514,15 @@ bool Look::isIdentity() const
 
 void Look::clampRanges()
 {
+    hdr.clampRanges();
     tone.clampRanges();
     color.clampRanges();
     curves.clampRanges();
     grading.clampRanges();
+    details.clampRanges();
     effects.clampRanges();
+    lens.clampRanges();
+    transform.clampRanges();
     for (auto& la : localAdjustments) la.clampRanges();
     for (auto& al : adjustmentLayers) al.clampRanges();
 }

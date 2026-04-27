@@ -35,11 +35,16 @@
 #include <QImage>
 #include <QPoint>
 #include <QPointF>
+#include <QRectF>
 #include <QWidget>
 
 namespace lps {
 struct LocalAdjustment;
 }
+
+class QKeyEvent;
+class QPainter;
+class QEvent;
 
 class PreviewWidget : public QWidget
 {
@@ -122,6 +127,17 @@ public:
     };
     void setMaskViewMode(MaskViewMode mode);
 
+    // ---- Crop overlay ----------------------------------------------------
+    // UI-only crop editing layer. The rectangle is normalized to image
+    // coordinates and is owned by MainWindow via Look::transform.cropRect.
+    // PreviewWidget only edits and displays it.
+    void setCropOverlayActive(bool on);
+    bool isCropOverlayActive() const { return m_cropOverlayActive; }
+    void setCropRect(const QRectF& cropRect);
+    QRectF cropRect() const { return m_cropRect; }
+    void setCropAspectRatio(double ratio);
+    void setCropAspectRatioLocked(bool locked);
+
     QSize sizeHint()        const override { return QSize(640, 480); }
     QSize minimumSizeHint() const override { return QSize(320, 240); }
 
@@ -144,6 +160,12 @@ signals:
     // a handle is grabbed.
     void maskHandleDragStarted();
     void maskGeometryChanged();
+    void maskBrushSettingsChanged();
+
+    void cropEditStarted();
+    void cropRectChanged(const QRectF& cropRect);
+    void cropEditCommitted();
+    void cropEditCanceled(const QRectF& cropRect);
 
 protected:
     void paintEvent       (QPaintEvent*  event) override;
@@ -153,6 +175,8 @@ protected:
     void mouseMoveEvent   (QMouseEvent*  event) override;
     void mouseReleaseEvent(QMouseEvent*  event) override;
     void mouseDoubleClickEvent(QMouseEvent* event) override;
+    void keyPressEvent(QKeyEvent* event) override;
+    void leaveEvent(QEvent* event) override;
 
 private:
     // ---- Coordinate conversion ------------------------------------------
@@ -229,6 +253,12 @@ private:
     void invalidateMaskOverlayCache();
     void paintMaskOverlay(QPainter& p, const QRectF& imageRectInWidget);
     void paintMaskHandles(QPainter& p);
+    bool activeMaskIsBrush() const;
+    bool widgetPosToImageNorm(const QPointF& widgetPos, QPointF& norm) const;
+    void updateBrushCursor(const QPointF& widgetPos);
+    double brushRadiusInWidget(const lps::LocalAdjustment& mask) const;
+    void beginBrushStroke(const QPointF& widgetPos, bool erase);
+    void appendBrushPoint(const QPointF& widgetPos);
 
     // Hit-test handles. Returns the index of the grabbed handle, or -1.
     // Handle indices are mask-type specific (see implementation).
@@ -238,4 +268,38 @@ private:
     // Drag state for handle interaction.
     int     m_grabbedHandle = -1;
     QPointF m_handleDragOffsetImageCoords;   // for "move whole gradient" handle
+    bool    m_brushPainting = false;
+    int     m_activeBrushStrokeIndex = -1;
+    QPointF m_lastBrushPointNorm;
+    QPointF m_brushCursorWidgetPos;
+    bool    m_brushCursorVisible = false;
+
+    // ---- Crop overlay state -----------------------------------------------
+    enum class CropHandle : int {
+        None = -1,
+        Move = 0,
+        TopLeft,
+        Top,
+        TopRight,
+        Right,
+        BottomRight,
+        Bottom,
+        BottomLeft,
+        Left,
+    };
+
+    bool       m_cropOverlayActive = false;
+    QRectF     m_cropRect = QRectF(0.0, 0.0, 1.0, 1.0);
+    QRectF     m_cropRectAtToolStart = QRectF(0.0, 0.0, 1.0, 1.0);
+    QRectF     m_cropDragStartRect = QRectF(0.0, 0.0, 1.0, 1.0);
+    QPointF    m_cropDragStartNorm;
+    CropHandle m_cropDragHandle = CropHandle::None;
+    bool       m_cropAspectLocked = false;
+    double     m_cropAspectRatio = 0.0;   // pixel width / height; <=0 = free
+
+    static QRectF normalizedCropRect(const QRectF& rect);
+    QRectF cropRectInWidget() const;
+    CropHandle hitTestCropHandle(const QPointF& widgetPos) const;
+    void applyCropDrag(const QPointF& widgetPos);
+    void paintCropOverlay(QPainter& p);
 };

@@ -10,6 +10,8 @@
 #include "util/ColorSpace.h"
 #include "util/ScanlineParallel.h"
 
+#include <utility>
+
 namespace lps {
 
 PixelBuffer PixelBuffer::fromSrgbImage(const QImage& src)
@@ -84,6 +86,23 @@ QImage PixelBuffer::toSrgbImage() const
     });
 
     return out;
+}
+
+void PixelBuffer::reset(int width, int height, std::vector<float>&& pixels)
+{
+    const size_t expected = (width > 0 && height > 0)
+                          ? static_cast<size_t>(width) * static_cast<size_t>(height) * 4
+                          : 0;
+    if (expected == 0 || pixels.size() != expected) {
+        m_width = 0;
+        m_height = 0;
+        m_pixels.clear();
+        return;
+    }
+
+    m_width = width;
+    m_height = height;
+    m_pixels = std::move(pixels);
 }
 
 } // namespace lps

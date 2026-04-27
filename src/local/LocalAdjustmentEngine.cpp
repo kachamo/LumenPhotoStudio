@@ -176,7 +176,9 @@ void applyOneMask(PixelBuffer& buffer, const LocalAdjustment& mask)
         // strength (Lightroom convention — softens the whole mask without
         // changing geometry). invert: w → 1 - w. Order: raw → invert →
         // density, so density attenuates the post-invert result.
-        const float density = std::clamp(mask.density, 0.0f, 1.0f);
+        const float density = (mask.type == MaskType::Brush)
+            ? 1.0f
+            : std::clamp(mask.density, 0.0f, 1.0f);
         const bool  invert  = mask.invert;
         const double v = (static_cast<double>(y) + 0.5) * invH;
         for (int x = 0; x < W; ++x) {

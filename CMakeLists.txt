@@ -19,6 +19,15 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
+include(GNUInstallDirs)
+
+set(LPS_APP_NAME "Lumen Photo Studio" CACHE STRING "Application display name")
+set(LPS_APP_VERSION "${PROJECT_VERSION}" CACHE STRING "Application version")
+set(LPS_COMPANY_NAME "Lumen" CACHE STRING "Company / organization name")
+set(LPS_APP_ICON_PATH "${CMAKE_CURRENT_SOURCE_DIR}/resources/icons/lumen_logo_512.png"
+    CACHE FILEPATH "Application icon path")
+set(LPS_INSTALL_DATA_DIR "${CMAKE_INSTALL_DATADIR}/LumenPhotoStudio")
+
 if(MSVC)
     add_compile_options(/W4 /permissive- /utf-8)
 else()
@@ -26,6 +35,24 @@ else()
 endif()
 
 find_package(Qt6 6.2 REQUIRED COMPONENTS Core Gui Concurrent Widgets)
+
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(PC_LIBRAW QUIET libraw)
+endif()
+
+find_path(LIBRAW_INCLUDE_DIR
+    NAMES libraw/libraw.h
+    HINTS ${PC_LIBRAW_INCLUDE_DIRS}
+)
+find_library(LIBRAW_LIBRARY
+    NAMES raw libraw raw_r
+    HINTS ${PC_LIBRAW_LIBRARY_DIRS}
+)
+set(LPS_HAS_LIBRAW OFF)
+if(LIBRAW_INCLUDE_DIR AND LIBRAW_LIBRARY)
+    set(LPS_HAS_LIBRAW ON)
+endif()
 
 set(LPS_SOURCES
     # core/
@@ -35,6 +62,16 @@ set(LPS_SOURCES
     src/core/ImagePipeline.cpp
     src/core/PixelBuffer.h
     src/core/PixelBuffer.cpp
+
+    # io/
+    src/io/ImageMetadataReader.h
+    src/io/ImageMetadataReader.cpp
+    src/io/RawImageLoader.h
+    src/io/RawImageLoader.cpp
+
+    # hdr/
+    src/hdr/HDRToneMapper.h
+    src/hdr/HDRToneMapper.cpp
 
     # tone/
     src/tone/ToneEngine.h
@@ -72,6 +109,14 @@ set(LPS_SOURCES
     src/grading/FilmProfiles.h
     src/grading/FilmProfiles.cpp
 
+    # details/
+    src/details/DetailsEngine.h
+    src/details/DetailsEngine.cpp
+
+    # transform/
+    src/transform/TransformEngine.h
+    src/transform/TransformEngine.cpp
+
     # effects/
     src/effects/EffectsEngine.h
     src/effects/EffectsEngine.cpp
@@ -87,11 +132,31 @@ set(LPS_SOURCES
     src/local/LocalAdjustmentEngine.cpp
     src/local/MaskGeometry.h
 
+    # lens/
+    src/lens/LensCorrectionEngine.h
+    src/lens/LensCorrectionEngine.cpp
+
     # preset/
     src/preset/PresetManager.h
     src/preset/PresetManager.cpp
     src/preset/LookSerializer.h
     src/preset/LookSerializer.cpp
+
+    # plugins/
+    src/plugins/PluginManager.h
+    src/plugins/PluginManager.cpp
+
+    # project/
+    src/project/AutosaveManager.h
+    src/project/AutosaveManager.cpp
+    src/project/ProjectDocument.h
+    src/project/ProjectDocument.cpp
+    src/project/ProjectSerializer.h
+    src/project/ProjectSerializer.cpp
+
+    # settings/
+    src/settings/SettingsManager.h
+    src/settings/SettingsManager.cpp
 
     # util/ (header-only)
     src/util/ScanlineParallel.h
@@ -113,6 +178,15 @@ target_link_libraries(lps_engine
         Qt6::Concurrent
 )
 
+if(LPS_HAS_LIBRAW)
+    target_compile_definitions(lps_engine PUBLIC LPS_HAS_LIBRAW=1)
+    target_include_directories(lps_engine PRIVATE ${LIBRAW_INCLUDE_DIR})
+    target_link_libraries(lps_engine PRIVATE ${LIBRAW_LIBRARY})
+    message(STATUS "LibRaw found: RAW support enabled")
+else()
+    message(STATUS "LibRaw not found: RAW support disabled")
+endif()
+
 # ==============================================================================
 # LumenPhotoUI — minimal Qt Widgets test UI for the engine
 #
@@ -130,10 +204,16 @@ set(LUMEN_UI_SOURCES
     ui/HistogramWidget.cpp
     ui/EmptyStateOverlay.h
     ui/EmptyStateOverlay.cpp
+    ui/WelcomeScreenWidget.h
+    ui/WelcomeScreenWidget.cpp
+    ui/ExportDialog.h
+    ui/ExportDialog.cpp
     ui/PreviewWidget.h
     ui/PreviewWidget.cpp
     ui/ColorWheelWidget.h
     ui/ColorWheelWidget.cpp
+    ui/NodeGraphWidget.h
+    ui/NodeGraphWidget.cpp
     ui/SecondaryViewerWindow.h
     ui/SecondaryViewerWindow.cpp
     resources/resources.qrc
@@ -154,4 +234,30 @@ target_link_libraries(LumenPhotoUI
         Qt6::Core
         Qt6::Gui
         Qt6::Widgets
+)
+
+# ==============================================================================
+# Install / packaging foundation
+# ==============================================================================
+file(MAKE_DIRECTORY
+    "${CMAKE_CURRENT_BINARY_DIR}/package-placeholders/plugins"
+    "${CMAKE_CURRENT_BINARY_DIR}/package-placeholders/presets"
+)
+
+install(TARGETS LumenPhotoUI
+    BUNDLE  DESTINATION .
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
+# Qt resources are compiled into the executable through resources.qrc.
+# Runtime extension points are installed as writable placeholders.
+install(DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/package-placeholders/plugins/"
+    DESTINATION "${LPS_INSTALL_DATA_DIR}/plugins"
+)
+install(DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/package-placeholders/presets/"
+    DESTINATION "${LPS_INSTALL_DATA_DIR}/presets"
+)
+
+install(FILES docs/DEPLOYMENT.md
+    DESTINATION "${LPS_INSTALL_DATA_DIR}/docs"
 )

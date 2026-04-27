@@ -5,14 +5,14 @@
 #include "MainWindow.h"
 
 #include <QApplication>
+#include <QCoreApplication>
 
 int main(int argc, char* argv[])
 {
     QApplication app(argc, argv);
 
-    // QApplication::setOrganizationName / setApplicationName can be set here
-    // once Anthropic-style settings/config persistence is wired in. For now
-    // the test UI runs stateless.
+    QCoreApplication::setOrganizationName(QStringLiteral("Lumen"));
+    QCoreApplication::setApplicationName(QStringLiteral("Lumen Photo Studio"));
 
     MainWindow window;
     window.show();

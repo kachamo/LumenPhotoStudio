@@ -16,10 +16,14 @@
 
 #include "color/ColorEngine.h"
 #include "curve/CurveEngine.h"
+#include "details/DetailsEngine.h"
 #include "effects/EffectsEngine.h"
+#include "hdr/HDRToneMapper.h"
+#include "lens/LensCorrectionEngine.h"
 #include "local/LocalAdjustmentEngine.h"
 #include "grading/ColorGrading.h"
 #include "tone/ToneEngine.h"
+#include "transform/TransformEngine.h"
 
 #include <QElapsedTimer>
 
@@ -73,6 +77,27 @@ RenderResult ImagePipeline::renderUpTo(const QImage& input, Look look, Stage sta
     //   - Mutates the shared `buffer` in place.
     //   - Does NOT allocate a second pixel buffer unless documented.
 
+    // Lens correction runs first — vignetting, distortion, and CA are
+    // physical defects of the optical chain, so we correct them before
+    // any tonal/color adjustments operate on the data. V1 implements
+    // vignetting compensation; distortion / CA / fringe are data-only
+    // placeholders.
+    LensCorrectionEngine::apply(buffer, look.lens);
+    if (stage == Stage::AfterLens) {
+        result.image     = buffer.toSrgbImage();
+        result.elapsedMs = timer.nsecsElapsed() / 1'000'000.0;
+        return result;
+    }
+
+    TransformEngine::apply(buffer, look.transform);
+    if (stage == Stage::AfterTransform) {
+        result.image     = buffer.toSrgbImage();
+        result.elapsedMs = timer.nsecsElapsed() / 1'000'000.0;
+        return result;
+    }
+
+    HDRToneMapper::apply(buffer, look.hdr);
+
     ToneEngine::apply(buffer, look.tone);
     if (stage == Stage::AfterTone) {
         result.image     = buffer.toSrgbImage();
@@ -102,6 +127,13 @@ RenderResult ImagePipeline::renderUpTo(const QImage& input, Look look, Stage sta
 
     ColorGrading::apply(buffer, look.grading);
     if (stage == Stage::AfterGrading) {
+        result.image     = buffer.toSrgbImage();
+        result.elapsedMs = timer.nsecsElapsed() / 1'000'000.0;
+        return result;
+    }
+
+    DetailsEngine::apply(buffer, look.details);
+    if (stage == Stage::AfterDetails) {
         result.image     = buffer.toSrgbImage();
         result.elapsedMs = timer.nsecsElapsed() / 1'000'000.0;
         return result;

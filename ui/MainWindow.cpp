@@ -6,18 +6,30 @@
 #include "ColorWheelWidget.h"
 #include "CurveEditorWidget.h"
 #include "EmptyStateOverlay.h"
+#include "ExportDialog.h"
 #include "HistogramWidget.h"
+#include "NodeGraphWidget.h"
 #include "PreviewWidget.h"
 #include "SecondaryViewerWindow.h"
+#include "WelcomeScreenWidget.h"
 
 #include "core/ImagePipeline.h"
+#include "io/ImageMetadataReader.h"
+#include "io/RawImageLoader.h"
+#include "plugins/PluginManager.h"
 #include "preset/LookSerializer.h"
+#include "project/AutosaveManager.h"
+#include "project/ProjectSerializer.h"
+#include "settings/SettingsManager.h"
 
 #include <QAction>
+#include <QAbstractItemView>
 #include <QApplication>
 #include <QClipboard>
 #include <QCoreApplication>
 #include <QCloseEvent>
+#include <QColor>
+#include <QDateTime>
 #include <QDesktopServices>
 #include <QDir>
 #include <QFile>
@@ -25,11 +37,20 @@
 #include <QFileInfo>
 #include <QFuture>
 #include <QFutureWatcher>
+#include <QFrame>
 #include <QGridLayout>
 #include <QCheckBox>
 #include <QComboBox>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QDockWidget>
+#include <QDragEnterEvent>
+#include <QDropEvent>
+#include <QFormLayout>
+#include <QHeaderView>
 #include <QHBoxLayout>
 #include <QIcon>
+#include <QImageWriter>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QKeyEvent>
@@ -40,22 +61,36 @@
 #include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
+#include <QMimeData>
+#include <QObject>
+#include <QPixmap>
 #include <QPushButton>
+#include <QRectF>
 #include <QScrollArea>
 #include <QShortcut>
 #include <QSignalBlocker>
+#include <QSize>
 #include <QSlider>
 #include <QStackedLayout>
+#include <QStackedWidget>
 #include <QStandardPaths>
+#include <QStringList>
+#include <QTabBar>
+#include <QTabWidget>
+#include <QTableWidget>
+#include <QTableWidgetItem>
 #include <QTimer>
 #include <QToolButton>
 #include <QUrl>
 #include <QVBoxLayout>
+#include <QWheelEvent>
 #include <QtConcurrent>
 
 #include <algorithm>
 #include <cmath>
 #include <array>
+#include <memory>
+#include <utility>
 
 // ==============================================================================
 // Tunables
@@ -73,6 +108,329 @@ constexpr int kPreviewMaxEdge = 1800;
 // Slider ranges. We store floats in lps::Look, so int slider values are
 // scaled by 100 for the "unit" sliders and directly for "-100..+100" sliders.
 constexpr int kExposureScale = 100;   // slider int / 100 → stops (e.g. 150 → 1.5 stops)
+
+class NoWheelSlider final : public QSlider
+{
+public:
+    explicit NoWheelSlider(Qt::Orientation orientation, QWidget* parent = nullptr)
+        : QSlider(orientation, parent)
+    {}
+
+protected:
+    void wheelEvent(QWheelEvent* event) override
+    {
+        event->ignore();
+    }
+};
+
+QString lumenDarkTheme()
+{
+    return QStringLiteral(R"(
+        QMainWindow, QWidget {
+            background-color: #0E0F12;
+            color: #E7E9EE;
+            selection-background-color: #CCFF00;
+            selection-color: #101114;
+        }
+        QMenuBar {
+            background: #0E0F12;
+            color: #D7DAE0;
+            border-bottom: 1px solid #2A2D35;
+            padding: 3px 8px;
+        }
+        QMenuBar::item {
+            background: transparent;
+            padding: 5px 10px;
+            border-radius: 5px;
+        }
+        QMenuBar::item:selected {
+            background: #1E2026;
+            color: #CCFF00;
+        }
+        QMenu {
+            background: #16181D;
+            color: #E7E9EE;
+            border: 1px solid #2A2D35;
+            border-radius: 8px;
+            padding: 6px;
+        }
+        QMenu::item {
+            padding: 6px 24px 6px 10px;
+            border-radius: 5px;
+        }
+        QMenu::item:selected {
+            background: #22262C;
+            color: #CCFF00;
+        }
+        QWidget#centralWorkspace {
+            background: #0E0F12;
+        }
+        QWidget#topWorkspaceBar {
+            background: #111318;
+            border: 1px solid #2A2D35;
+            border-radius: 10px;
+        }
+        QWidget#workspaceBody {
+            background: transparent;
+        }
+        QWidget#canvasHost {
+            background: transparent;
+        }
+        QTabBar#documentTabs {
+            background: transparent;
+            border: 0;
+        }
+        QTabBar#documentTabs::tab {
+            background: #16181D;
+            color: #9EA4AE;
+            border: 1px solid #2A2D35;
+            border-bottom-color: #1E2026;
+            border-top-left-radius: 8px;
+            border-top-right-radius: 8px;
+            padding: 7px 28px 7px 14px;
+            margin-right: 3px;
+            min-width: 110px;
+        }
+        QTabBar#documentTabs::tab:hover {
+            background: #1E2026;
+            color: #E7E9EE;
+        }
+        QTabBar#documentTabs::tab:selected {
+            background: #1E2026;
+            color: #CCFF00;
+            border-color: #CCFF00;
+        }
+        QWidget#leftToolRail {
+            background: #111318;
+            border: 1px solid #2A2D35;
+            border-radius: 10px;
+        }
+        QWidget#analysisPanel {
+            background: #111318;
+            border: 1px solid #2A2D35;
+            border-radius: 10px;
+        }
+        QWidget#analysisHeader {
+            background: #1E2026;
+            border-bottom: 1px solid #2A2D35;
+            border-top-left-radius: 10px;
+            border-top-right-radius: 10px;
+        }
+        QScrollArea#analysisScroll {
+            background: transparent;
+            border: 0;
+        }
+        QFrame#analysisCard {
+            background: #16181D;
+            border: 1px solid #2A2D35;
+            border-radius: 8px;
+        }
+        QLabel#navigatorPreview {
+            background: #0E0F12;
+            border: 1px solid #2A2D35;
+            border-radius: 6px;
+        }
+        QLabel#metadataName {
+            color: #9EA4AE;
+            font-size: 11px;
+        }
+        QLabel#metadataValue {
+            color: #DDE0E7;
+            font-size: 11px;
+        }
+        QWidget#sidebarHost {
+            background: transparent;
+        }
+        QWidget#sidebarFull, QWidget#sidebarMini, QWidget#controlPanelCard {
+            background: #16181D;
+            border: 1px solid #2A2D35;
+            border-radius: 10px;
+        }
+        QWidget#controlHeader {
+            background: #1E2026;
+            border-bottom: 1px solid #2A2D35;
+            border-top-left-radius: 10px;
+            border-top-right-radius: 10px;
+        }
+        QScrollArea#controlScroll {
+            background: transparent;
+            border: 0;
+        }
+        QScrollArea#controlScroll > QWidget > QWidget {
+            background: transparent;
+        }
+        QLabel {
+            color: #DDE0E7;
+            background: transparent;
+        }
+        QPushButton, QToolButton {
+            background: #1E2026;
+            color: #E7E9EE;
+            border: 1px solid #2A2D35;
+            border-radius: 7px;
+            padding: 5px 9px;
+        }
+        QPushButton:hover, QToolButton:hover {
+            background: #24272E;
+            border-color: #3D424E;
+            color: #FFFFFF;
+        }
+        QPushButton:pressed, QToolButton:pressed {
+            background: #CCFF00;
+            border-color: #CCFF00;
+            color: #101114;
+        }
+        QPushButton:disabled, QToolButton:disabled {
+            background: #15171B;
+            color: #666A72;
+            border-color: #24272B;
+        }
+        QToolButton[navButton="true"] {
+            background: transparent;
+            color: #7A7A7A;
+            border: 1px solid transparent;
+            border-radius: 8px;
+            padding: 4px;
+        }
+        QToolButton[navButton="true"]:hover {
+            background: #1E2026;
+            color: #B0B0B0;
+            border-color: #2A2D35;
+        }
+        QToolButton[navButton="true"]:checked {
+            background: rgba(204, 255, 0, 31);
+            color: #CCFF00;
+            border-color: #CCFF00;
+        }
+        QCheckBox {
+            spacing: 8px;
+            color: #DDE0E7;
+            background: transparent;
+        }
+        QCheckBox::indicator {
+            width: 14px;
+            height: 14px;
+            border: 1px solid #3D424E;
+            border-radius: 4px;
+            background: #111318;
+        }
+        QCheckBox::indicator:hover {
+            border-color: #B0B0B0;
+        }
+        QCheckBox::indicator:checked {
+            background: #CCFF00;
+            border-color: #CCFF00;
+        }
+        QSlider::groove:horizontal {
+            height: 3px;
+            background: #2A2D35;
+            border-radius: 2px;
+        }
+        QSlider::sub-page:horizontal {
+            background: #CCFF00;
+            border-radius: 2px;
+        }
+        QSlider::add-page:horizontal {
+            background: #2A2D35;
+            border-radius: 2px;
+        }
+        QSlider::handle:horizontal {
+            width: 14px;
+            height: 14px;
+            margin: -6px 0;
+            border-radius: 7px;
+            background: #8B929D;
+            border: 1px solid #B0B7C2;
+        }
+        QSlider::handle:horizontal:hover {
+            background: #CCFF00;
+            border-color: #CCFF00;
+        }
+        QLineEdit, QComboBox {
+            background: #111318;
+            color: #E7E9EE;
+            border: 1px solid #2A2D35;
+            border-radius: 7px;
+            padding: 5px 8px;
+        }
+        QLineEdit:focus, QComboBox:focus {
+            border-color: #CCFF00;
+        }
+        QListWidget {
+            background: #111318;
+            color: #E7E9EE;
+            border: 1px solid #2A2D35;
+            border-radius: 8px;
+            padding: 4px;
+            outline: 0;
+        }
+        QListWidget::item {
+            padding: 5px 6px;
+            border-radius: 5px;
+        }
+        QListWidget::item:selected {
+            background: rgba(204, 255, 0, 36);
+            color: #FFFFFF;
+        }
+        QScrollBar:vertical {
+            background: transparent;
+            width: 8px;
+            margin: 4px 0;
+        }
+        QScrollBar::handle:vertical {
+            background: #2A2D35;
+            border-radius: 4px;
+            min-height: 28px;
+        }
+        QScrollBar::handle:vertical:hover {
+            background: #3D424E;
+        }
+        QScrollBar::add-line:vertical,
+        QScrollBar::sub-line:vertical {
+            height: 0;
+        }
+        QDockWidget {
+            background: #16181D;
+            color: #E7E9EE;
+            border: 1px solid #2A2D35;
+        }
+        QDockWidget::title {
+            background: #1E2026;
+            border-bottom: 1px solid #2A2D35;
+            padding: 6px 10px;
+            text-align: left;
+        }
+        QWidget#bottomWorkspaceContainer {
+            background: #111318;
+        }
+        QFrame#bottomWorkspaceHeader {
+            background: #16181D;
+            border-top: 1px solid #2A2D35;
+            border-bottom: 1px solid #2A2D35;
+        }
+        QTabWidget#bottomPanelTabs::pane {
+            background: #111318;
+            border: 1px solid #2A2D35;
+            border-radius: 10px;
+            top: -1px;
+        }
+        QTabWidget#bottomPanelTabs QTabBar::tab {
+            background: #16181D;
+            color: #9EA4AE;
+            border: 1px solid #2A2D35;
+            border-bottom: 0;
+            border-top-left-radius: 7px;
+            border-top-right-radius: 7px;
+            padding: 6px 16px;
+            margin-right: 4px;
+        }
+        QTabWidget#bottomPanelTabs QTabBar::tab:selected {
+            background: #1E2026;
+            color: #CCFF00;
+            border-color: #CCFF00;
+        }
+    )");
+}
 
 // ---- HSL channel table ------------------------------------------------------
 // One entry per canonical photo hue. Drives:
@@ -140,11 +498,19 @@ MainWindow::MainWindow(QWidget* parent)
 {
     setWindowTitle(tr("Lumen Photo Studio — Engine Test UI"));
     resize(1280, 800);
+    setAcceptDrops(true);
 
     m_debounce = new QTimer(this);
     m_debounce->setSingleShot(true);
     m_debounce->setInterval(kDebounceMs);
     connect(m_debounce, &QTimer::timeout, this, &MainWindow::onDebounceFired);
+
+    m_pluginManager = std::make_unique<lps::PluginManager>();
+    m_settings = std::make_unique<lps::SettingsManager>();
+    m_autosaveManager = std::make_unique<lps::AutosaveManager>();
+    m_bottomWorkspaceEnabled = m_settings->bottomWorkspaceVisible();
+    m_bottomWorkspaceCollapsed = m_settings->bottomWorkspaceCollapsed();
+    m_analysisPanelCollapsed = m_settings->analysisPanelCollapsed();
 
     buildUi();
 
@@ -163,6 +529,10 @@ MainWindow::MainWindow(QWidget* parent)
     auto* redoScAlt = new QShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+Z")), this);
     redoScAlt->setContext(Qt::ApplicationShortcut);
     connect(redoScAlt, &QShortcut::activated, this, &MainWindow::redo);
+
+    QTimer::singleShot(0, this, [this]() {
+        checkAutosaveRecovery();
+    });
 }
 
 MainWindow::~MainWindow() = default;
@@ -172,6 +542,8 @@ MainWindow::~MainWindow() = default;
 // ==============================================================================
 void MainWindow::buildUi()
 {
+    setStyleSheet(lumenDarkTheme());
+
     // Top-level menus (File, Edit, View, Window, Plugins, Help). Built in
     // a dedicated method to keep buildUi() focused on widget layout.
     // buildMenus also stores QAction* members for actions that need to be
@@ -179,10 +551,169 @@ void MainWindow::buildUi()
     // visibility toggles, etc.).
     buildMenus();
 
-    auto* central = new QWidget(this);
-    auto* root = new QHBoxLayout(central);
-    root->setContentsMargins(8, 8, 8, 8);
-    root->setSpacing(8);
+    m_workspaceStack = new QStackedWidget(this);
+    m_workspaceStack->setObjectName(QStringLiteral("workspaceStack"));
+
+    m_welcomeScreen = new WelcomeScreenWidget(m_workspaceStack);
+    if (m_settings)
+        m_welcomeScreen->setShowOnStartup(m_settings->showWelcomeOnStartup());
+    connect(m_welcomeScreen, &WelcomeScreenWidget::showOnStartupChanged,
+            this, [this](bool on) {
+        if (m_settings) m_settings->setShowWelcomeOnStartup(on);
+    });
+    connect(m_welcomeScreen, &WelcomeScreenWidget::openImageRequested,
+            this, &MainWindow::onOpenImage);
+    connect(m_welcomeScreen, &WelcomeScreenWidget::openProjectRequested,
+            this, &MainWindow::onOpenProject);
+    connect(m_welcomeScreen, &WelcomeScreenWidget::recentImageRequested,
+            this, [this](const QString& path) {
+        if (!QFileInfo(path).isFile()) {
+            if (m_settings) {
+                m_settings->setRecentImages(m_settings->recentImages());
+                refreshWelcomeRecentFiles();
+            }
+            QMessageBox::information(this, tr("Recent Image"),
+                                     tr("This image no longer exists."));
+            return;
+        }
+        loadImageFromPath(path);
+    });
+    connect(m_welcomeScreen, &WelcomeScreenWidget::recentProjectRequested,
+            this, [this](const QString& path) {
+        if (!QFileInfo(path).isFile()) {
+            if (m_settings) {
+                m_settings->setRecentProjects(m_settings->recentProjects());
+                refreshWelcomeRecentFiles();
+            }
+            QMessageBox::information(this, tr("Recent Project"),
+                                     tr("This project no longer exists."));
+            return;
+        }
+        loadProjectFromPath(path);
+    });
+    connect(m_welcomeScreen, &WelcomeScreenWidget::newProjectRequested, this,
+            [this]() {
+        QMessageBox::information(this, tr("New Project"),
+                                 tr("New Project is not yet available."));
+    });
+    connect(m_welcomeScreen, &WelcomeScreenWidget::preferencesRequested,
+            this, &MainWindow::onPreferences);
+    connect(m_welcomeScreen, &WelcomeScreenWidget::pluginsRequested,
+            this, &MainWindow::onPluginManager);
+    connect(m_welcomeScreen, &WelcomeScreenWidget::imageFileDropped, this,
+            [this](const QString& droppedPath) {
+        loadImageFromPath(droppedPath);
+    });
+    m_workspaceStack->addWidget(m_welcomeScreen);
+    refreshWelcomeRecentFiles();
+
+    auto* central = new QWidget(m_workspaceStack);
+    m_editorWorkspace = central;
+    central->setObjectName(QStringLiteral("centralWorkspace"));
+    auto* root = new QVBoxLayout(central);
+    root->setContentsMargins(10, 10, 10, 10);
+    root->setSpacing(10);
+
+    // ---- Top workspace bar -------------------------------------------------
+    m_workspaceBar = new QWidget(central);
+    m_workspaceBar->setObjectName(QStringLiteral("topWorkspaceBar"));
+    {
+        auto* barLay = new QHBoxLayout(m_workspaceBar);
+        barLay->setContentsMargins(12, 6, 12, 6);
+        barLay->setSpacing(10);
+
+        auto* logo = new QLabel(m_workspaceBar);
+        logo->setPixmap(QIcon(QStringLiteral(":/icons/lumen_logo_512.png")).pixmap(24, 24));
+        logo->setFixedSize(26, 26);
+        logo->setAlignment(Qt::AlignCenter);
+        barLay->addWidget(logo);
+
+        auto* title = new QLabel(tr("Lumen Photo Studio"), m_workspaceBar);
+        QFont titleFont = title->font();
+        titleFont.setBold(true);
+        title->setFont(titleFont);
+        title->setStyleSheet("color: #F0F2F6;");
+        barLay->addWidget(title);
+
+        auto* workspace = new QLabel(tr("Edit Workspace"), m_workspaceBar);
+        workspace->setStyleSheet(
+            "QLabel { color: #CCFF00; background: #16181D;"
+            "         border: 1px solid #2A2D35; border-radius: 8px;"
+            "         padding: 5px 14px; }");
+        barLay->addWidget(workspace);
+        barLay->addStretch(1);
+
+        auto* status = new QLabel(tr("Workspace Bar Placeholder"), m_workspaceBar);
+        status->setStyleSheet("color: #7A7A7A;");
+        barLay->addWidget(status);
+    }
+    root->addWidget(m_workspaceBar, 0);
+
+    auto* body = new QWidget(central);
+    body->setObjectName(QStringLiteral("workspaceBody"));
+    auto* bodyLay = new QHBoxLayout(body);
+    bodyLay->setContentsMargins(0, 0, 0, 0);
+    bodyLay->setSpacing(10);
+
+    // ---- Left vertical tool rail ------------------------------------------
+    m_toolRail = new QWidget(body);
+    m_toolRail->setObjectName(QStringLiteral("leftToolRail"));
+    m_toolRail->setFixedWidth(86);
+    {
+        auto* railLay = new QVBoxLayout(m_toolRail);
+        railLay->setContentsMargins(6, 10, 6, 10);
+        railLay->setSpacing(4);
+
+        struct RailAction {
+            const char* iconPath;
+            const char* text;
+            const char* action;
+        };
+        const RailAction actions[] = {
+            { ":/icons/sidebar/presets.svg",   "Library",   "Library"   },
+            { ":/icons/sidebar/histogram.svg", "Histogram", "Histogram" },
+            { ":/icons/sidebar/tone.svg",      "Tone",      "Tone"      },
+            { ":/icons/sidebar/color.svg",     "Color",     "Color"     },
+            { ":/icons/sidebar/hsl.svg",       "HSL",       "HSL"       },
+            { ":/icons/sidebar/curves.svg",    "Curves",    "Curves"    },
+            { ":/icons/sidebar/grading.svg",   "Grading",   "Grading"   },
+            { ":/icons/sidebar/lens.svg",      "Lens",      "Lens"      },
+            { ":/icons/sidebar/plugins.svg",   "Details",   "Details"   },
+            { ":/icons/sidebar/mask.svg",      "Masks",     "Masks"     },
+            { ":/icons/sidebar/presets.svg",   "Layers",    "Layers"    },
+            { ":/icons/sidebar/nodes.svg",     "Nodes",     "Nodes"     },
+            { ":/icons/sidebar/plugins.svg",   "Export",    "Export"    },
+        };
+
+        for (const auto& action : actions) {
+            auto* btn = new QToolButton(m_toolRail);
+            btn->setIcon(QIcon(QString::fromLatin1(action.iconPath)));
+            btn->setIconSize(QSize(18, 18));
+            btn->setText(tr(action.text));
+            btn->setToolButtonStyle(Qt::ToolButtonTextUnderIcon);
+            btn->setToolTip(tr(action.text));
+            btn->setCursor(Qt::PointingHandCursor);
+            btn->setFixedSize(72, 48);
+            btn->setProperty("navButton", true);
+            btn->setCheckable(true);
+            const QString actionName = QString::fromLatin1(action.action);
+            connect(btn, &QToolButton::clicked, this, [this, actionName, btn]() {
+                for (auto* child : m_toolRail->findChildren<QToolButton*>()) {
+                    if (child->isCheckable() && child != btn)
+                        child->setChecked(false);
+                }
+                btn->setChecked(true);
+                handleRailAction(actionName);
+            });
+            railLay->addWidget(btn, 0, Qt::AlignHCenter);
+        }
+        railLay->addStretch(1);
+    }
+    bodyLay->addWidget(m_toolRail, 0);
+
+    m_analysisPanel = buildAnalysisPanel();
+    bodyLay->addWidget(m_analysisPanel, 0);
+    setAnalysisPanelCollapsed(m_analysisPanelCollapsed);
 
     // ---- Preview (left, expanding) ------------------------------------------
     // Two layered widgets:
@@ -199,8 +730,34 @@ void MainWindow::buildUi()
     // document workflows can re-parent or share the same overlay across
     // previews without each preview surface needing its own empty-state
     // machinery.
-    m_previewLabel = new PreviewWidget(central);
-    root->addWidget(m_previewLabel, /*stretch=*/1);
+    auto* canvasHost = new QWidget(central);
+    canvasHost->setObjectName(QStringLiteral("canvasHost"));
+    auto* canvasLay = new QVBoxLayout(canvasHost);
+    canvasLay->setContentsMargins(0, 0, 0, 0);
+    canvasLay->setSpacing(0);
+
+    m_documentTabs = new QTabBar(canvasHost);
+    m_documentTabs->setObjectName(QStringLiteral("documentTabs"));
+    m_documentTabs->setDocumentMode(true);
+    m_documentTabs->setExpanding(false);
+    m_documentTabs->setMovable(false);
+    m_documentTabs->setTabsClosable(true);
+    m_documentTabs->setVisible(false);
+    connect(m_documentTabs, &QTabBar::currentChanged,
+            this, [this](int index) {
+        if (m_syncingDocumentTabs) return;
+        setActiveDocumentIndex(index);
+    });
+    connect(m_documentTabs, &QTabBar::tabCloseRequested,
+            this, [this](int index) {
+        closeDocumentAt(index);
+    });
+    canvasLay->addWidget(m_documentTabs, 0);
+
+    m_previewLabel = new PreviewWidget(canvasHost);
+    m_previewLabel->setObjectName(QStringLiteral("previewSurface"));
+    canvasLay->addWidget(m_previewLabel, /*stretch=*/1);
+    bodyLay->addWidget(canvasHost, /*stretch=*/1);
 
     // Overlay: child of m_previewLabel, geometry tracked via resize event
     // forwarding inside the overlay class.
@@ -216,7 +773,6 @@ void MainWindow::buildUi()
     // work in progress.
     connect(m_emptyState, &EmptyStateOverlay::imageFileDropped, this,
             [this](const QString& droppedPath) {
-        if (!maybePromptUnsavedChanges()) return;
         loadImageFromPath(droppedPath);
     });
 
@@ -237,9 +793,47 @@ void MainWindow::buildUi()
     // (refresh dependent UI + kick render debounce). Same one-snapshot-
     // per-drag pattern as sliders.
     connect(m_previewLabel, &PreviewWidget::maskHandleDragStarted,
-            this, &MainWindow::pushUndoSnapshot);
+            this, [this]() {
+        m_nextHistoryLabel = tr("Mask changed");
+        pushUndoSnapshot();
+    });
     connect(m_previewLabel, &PreviewWidget::maskGeometryChanged,
             this, &MainWindow::onMaskGeometryChangedFromPreview);
+    connect(m_previewLabel, &PreviewWidget::maskBrushSettingsChanged,
+            this, [this]() {
+        refreshMaskWidgets();
+        markDirty();
+    });
+    connect(m_previewLabel, &PreviewWidget::cropEditStarted,
+            this, [this]() {
+        m_nextHistoryLabel = tr("Crop changed");
+        pushUndoSnapshot();
+    });
+    connect(m_previewLabel, &PreviewWidget::cropRectChanged,
+            this, [this](const QRectF& cropRect) {
+        m_look.transform.cropRect = cropRect;
+        if (m_debounce) m_debounce->start();
+    });
+    connect(m_previewLabel, &PreviewWidget::cropEditCommitted,
+            this, [this]() {
+        if (m_cropToolBtn) {
+            QSignalBlocker block(m_cropToolBtn);
+            m_cropToolBtn->setChecked(false);
+        }
+        if (m_previewLabel) m_previewLabel->setCropOverlayActive(false);
+        if (m_debounce) m_debounce->start();
+    });
+    connect(m_previewLabel, &PreviewWidget::cropEditCanceled,
+            this, [this](const QRectF& cropRect) {
+        m_look.transform.cropRect = cropRect;
+        if (m_cropToolBtn) {
+            QSignalBlocker block(m_cropToolBtn);
+            m_cropToolBtn->setChecked(false);
+        }
+        if (m_previewLabel) m_previewLabel->setCropOverlayActive(false);
+        refreshTransformWidgets();
+        if (m_debounce) m_debounce->start();
+    });
 
     // ---- Controls sidebar (right) -------------------------------------------
     // The sidebar is a QStackedLayout container with two children:
@@ -251,9 +845,11 @@ void MainWindow::buildUi()
     //                   back to the full view.
     // QStackedLayout shows exactly one child at a time but keeps both alive.
     m_sidebarFull = buildControlPanel();
+    m_sidebarFull->setObjectName(QStringLiteral("sidebarFull"));
     m_sidebarFull->setMinimumWidth(320);
 
     m_sidebarMini = new QWidget(central);
+    m_sidebarMini->setObjectName(QStringLiteral("sidebarMini"));
     {
         auto* miniLay = new QVBoxLayout(m_sidebarMini);
         miniLay->setContentsMargins(2, 8, 2, 8);
@@ -268,6 +864,7 @@ void MainWindow::buildUi()
         expandBtn->setToolTip(tr("Expand controls panel"));
         expandBtn->setCursor(Qt::PointingHandCursor);
         expandBtn->setFixedSize(32, 32);
+        expandBtn->setProperty("navButton", true);
         connect(expandBtn, &QToolButton::clicked,
                 this, &MainWindow::onToggleSidebar);
         miniLay->addWidget(expandBtn, 0, Qt::AlignHCenter);
@@ -279,19 +876,28 @@ void MainWindow::buildUi()
         // #7A7A7A, hover #CCFF00 (the brand accent). Clicking any icon
         // re-expands the sidebar; future work could scroll-to the
         // corresponding section after expanding.
-        const struct {
-            const char* iconPath;   // resource path
+        // Each row: icon path, tooltip, and a per-row action enum.
+        // Most rows just toggle the sidebar (the user wanted to see the
+        // section but the strip is collapsed); the Nodes row instead
+        // opens the Node Graph dock.
+        enum class StripAction { ToggleSidebar, OpenNodeGraph };
+        struct StripSection {
+            const char* iconPath;
             const char* tip;
-        } kSections[] = {
-            { ":/icons/sidebar/histogram.svg", "Histogram" },
-            { ":/icons/sidebar/tone.svg",      "Tone"      },
-            { ":/icons/sidebar/color.svg",     "Color"     },
-            { ":/icons/sidebar/hsl.svg",       "HSL"       },
-            { ":/icons/sidebar/curves.svg",    "Curves"    },
-            { ":/icons/sidebar/grading.svg",   "Color Grading" },
-            { ":/icons/sidebar/mask.svg",      "Masks"     },
-            { ":/icons/sidebar/presets.svg",   "Presets"   },
-            { ":/icons/sidebar/plugins.svg",   "Plugins"   },
+            StripAction action;
+        };
+        const StripSection kSections[] = {
+            { ":/icons/sidebar/histogram.svg", "Histogram",     StripAction::ToggleSidebar },
+            { ":/icons/sidebar/tone.svg",      "Tone",          StripAction::ToggleSidebar },
+            { ":/icons/sidebar/color.svg",     "Color",         StripAction::ToggleSidebar },
+            { ":/icons/sidebar/hsl.svg",       "HSL",           StripAction::ToggleSidebar },
+            { ":/icons/sidebar/curves.svg",    "Curves",        StripAction::ToggleSidebar },
+            { ":/icons/sidebar/grading.svg",   "Color Grading", StripAction::ToggleSidebar },
+            { ":/icons/sidebar/lens.svg",      "Lens Correction", StripAction::ToggleSidebar },
+            { ":/icons/sidebar/mask.svg",      "Masks",         StripAction::ToggleSidebar },
+            { ":/icons/sidebar/nodes.svg",     "Node Graph",    StripAction::OpenNodeGraph },
+            { ":/icons/sidebar/presets.svg",   "Presets",       StripAction::ToggleSidebar },
+            { ":/icons/sidebar/plugins.svg",   "Plugins",       StripAction::ToggleSidebar },
         };
         // Stylesheet recipe: SVGs are loaded as QIcon; the surrounding
         // QToolButton text color drives currentColor in the rendered
@@ -303,9 +909,12 @@ void MainWindow::buildUi()
         // resolved by Qt's SVG renderer to the default text color).
         const QString miniBtnQss =
             "QToolButton { background: transparent; border: 1px solid transparent;"
-            "              border-radius: 4px; padding: 2px;"
+            "              border-radius: 8px; padding: 4px;"
             "              color: #7A7A7A; }"
-            "QToolButton:hover { color: #CCFF00; border-color: #2a2a2e; }";
+            "QToolButton:hover { background: #1E2026; color: #B0B0B0;"
+            "                    border-color: #2A2D35; }"
+            "QToolButton:checked { background: rgba(204, 255, 0, 31);"
+            "                       color: #CCFF00; border-color: #CCFF00; }";
         for (const auto& s : kSections) {
             auto* btn = new QToolButton(m_sidebarMini);
             btn->setIcon(QIcon(QString::fromLatin1(s.iconPath)));
@@ -313,26 +922,616 @@ void MainWindow::buildUi()
             btn->setToolTip(tr(s.tip));
             btn->setCursor(Qt::PointingHandCursor);
             btn->setFixedSize(32, 32);
+            btn->setProperty("navButton", true);
             btn->setStyleSheet(miniBtnQss);
-            connect(btn, &QToolButton::clicked,
-                    this, &MainWindow::onToggleSidebar);
+            if (s.action == StripAction::OpenNodeGraph)
+                btn->setCheckable(true);
+            switch (s.action) {
+            case StripAction::ToggleSidebar:
+                connect(btn, &QToolButton::clicked,
+                        this, &MainWindow::onToggleSidebar);
+                break;
+            case StripAction::OpenNodeGraph:
+                connect(btn, &QToolButton::clicked,
+                        this, &MainWindow::onShowNodeGraph);
+                break;
+            }
             miniLay->addWidget(btn, 0, Qt::AlignHCenter);
         }
         miniLay->addStretch(1);
     }
 
     m_sidebarHost  = new QWidget(central);
+    m_sidebarHost->setObjectName(QStringLiteral("sidebarHost"));
     m_sidebarStack = new QStackedLayout(m_sidebarHost);
     m_sidebarStack->setContentsMargins(0, 0, 0, 0);
     m_sidebarStack->addWidget(m_sidebarFull);
     m_sidebarStack->addWidget(m_sidebarMini);
     m_sidebarStack->setCurrentWidget(m_sidebarFull);   // start expanded
-    root->addWidget(m_sidebarHost, /*stretch=*/0);
+    bodyLay->addWidget(m_sidebarHost, /*stretch=*/0);
 
-    setCentralWidget(central);
+    root->addWidget(body, /*stretch=*/1);
+
+    m_workspaceStack->addWidget(central);
+    setCentralWidget(m_workspaceStack);
+
+    // ---- Bottom dock panel -------------------------------------------------
+    m_nodeGraph = new NodeGraphWidget(this);
+    m_nodeGraph->setMinimumHeight(180);
+
+    m_bottomWorkspaceContainer = new QWidget(this);
+    m_bottomWorkspaceContainer->setObjectName(QStringLiteral("bottomWorkspaceContainer"));
+    auto* bottomLay = new QVBoxLayout(m_bottomWorkspaceContainer);
+    bottomLay->setContentsMargins(0, 0, 0, 0);
+    bottomLay->setSpacing(0);
+
+    auto* bottomHeader = new QFrame(m_bottomWorkspaceContainer);
+    bottomHeader->setObjectName(QStringLiteral("bottomWorkspaceHeader"));
+    auto* bottomHeaderLay = new QHBoxLayout(bottomHeader);
+    bottomHeaderLay->setContentsMargins(10, 6, 10, 6);
+    bottomHeaderLay->setSpacing(8);
+
+    auto* bottomTitle = new QLabel(tr("Bottom Workspace"), bottomHeader);
+    bottomTitle->setStyleSheet("color: #E7E9EE; font-weight: 700;");
+    bottomHeaderLay->addWidget(bottomTitle);
+    bottomHeaderLay->addStretch(1);
+
+    m_bottomWorkspaceCollapseBtn = new QToolButton(bottomHeader);
+    m_bottomWorkspaceCollapseBtn->setText(QStringLiteral("v"));
+    m_bottomWorkspaceCollapseBtn->setToolTip(tr("Collapse bottom workspace"));
+    m_bottomWorkspaceCollapseBtn->setCursor(Qt::PointingHandCursor);
+    m_bottomWorkspaceCollapseBtn->setFixedSize(28, 24);
+    m_bottomWorkspaceCollapseBtn->setProperty("navButton", true);
+    connect(m_bottomWorkspaceCollapseBtn, &QToolButton::clicked, this, [this]() {
+        setBottomWorkspaceCollapsed(!m_bottomWorkspaceCollapsed);
+    });
+    bottomHeaderLay->addWidget(m_bottomWorkspaceCollapseBtn);
+    bottomLay->addWidget(bottomHeader, 0);
+
+    m_bottomPanelTabs = new QTabWidget(this);
+    m_bottomPanelTabs->setObjectName(QStringLiteral("bottomPanelTabs"));
+    m_bottomPanelTabs->addTab(m_nodeGraph, tr("Nodes"));
+
+    auto* layersTab = new QWidget(m_bottomPanelTabs);
+    auto* layersLay = new QVBoxLayout(layersTab);
+    layersLay->setContentsMargins(14, 12, 14, 12);
+    auto* layersLabel = new QLabel(tr("Layers panel placeholder"), layersTab);
+    layersLabel->setAlignment(Qt::AlignCenter);
+    layersLabel->setStyleSheet("color: #7A7A7A;");
+    layersLay->addWidget(layersLabel, 1);
+    m_bottomPanelTabs->addTab(layersTab, tr("Layers"));
+
+    auto* historyTab = new QWidget(m_bottomPanelTabs);
+    auto* historyLay = new QVBoxLayout(historyTab);
+    historyLay->setContentsMargins(14, 12, 14, 12);
+    historyLay->setSpacing(8);
+
+    m_historyList = new QListWidget(historyTab);
+    m_historyList->setObjectName(QStringLiteral("historyList"));
+    m_historyList->setSelectionMode(QAbstractItemView::SingleSelection);
+    m_historyList->setUniformItemSizes(true);
+    m_historyList->setStyleSheet(
+        "QListWidget { background-color: #111318;"
+        " border: 1px solid #2A2D35; border-radius: 8px; padding: 6px; }"
+        "QListWidget::item { padding: 6px 8px; border-radius: 5px; }"
+        "QListWidget::item:selected { background: rgba(204, 255, 0, 36);"
+        " color: #CCFF00; }");
+    connect(m_historyList, &QListWidget::itemClicked, this,
+            [this](QListWidgetItem*) {
+        if (m_syncingHistorySelection) return;
+        refreshHistoryList();
+    });
+    historyLay->addWidget(m_historyList, 1);
+    m_bottomPanelTabs->addTab(historyTab, tr("History"));
+    bottomLay->addWidget(m_bottomPanelTabs, 1);
+
+    m_nodeGraphDock = new QDockWidget(tr("Workspace"), this);
+    m_nodeGraphDock->setObjectName(QStringLiteral("bottomWorkspaceDock"));
+    m_nodeGraphDock->setAllowedAreas(Qt::BottomDockWidgetArea);
+    m_nodeGraphDock->setFeatures(
+        QDockWidget::DockWidgetMovable
+      | QDockWidget::DockWidgetFloatable
+      | QDockWidget::DockWidgetClosable);
+    m_nodeGraphDock->setWidget(m_bottomWorkspaceContainer);
+    addDockWidget(Qt::BottomDockWidgetArea, m_nodeGraphDock);
+    connect(m_nodeGraphDock, &QDockWidget::visibilityChanged,
+            this, [this](bool visible) {
+        if (m_syncingBottomWorkspaceVisibility) return;
+        if (!m_editorWorkspaceActive) return;
+        m_bottomWorkspaceEnabled = visible;
+        if (m_settings) m_settings->setBottomWorkspaceVisible(visible);
+        if (m_actShowBottomWorkspace) {
+            QSignalBlocker block(m_actShowBottomWorkspace);
+            m_actShowBottomWorkspace->setChecked(visible);
+        }
+    });
 
     // Initial title — no project, no image yet.
     updateWindowTitle();
+    setBottomWorkspaceCollapsed(m_bottomWorkspaceCollapsed);
+    if (!m_documents.empty() && m_settings && !m_settings->showWelcomeOnStartup())
+        showEditorWorkspace();
+    else
+        showWelcomeScreen();
+}
+
+void MainWindow::showWelcomeScreen()
+{
+    m_editorWorkspaceActive = false;
+    if (m_workspaceStack)
+        m_workspaceStack->setCurrentIndex(0);
+    updateBottomWorkspaceVisibility();
+}
+
+void MainWindow::showEditorWorkspace()
+{
+    m_editorWorkspaceActive = true;
+    if (m_workspaceStack)
+        m_workspaceStack->setCurrentIndex(1);
+    updateBottomWorkspaceVisibility();
+}
+
+MainWindow::ImageDocument MainWindow::makeDocumentFromCurrentState() const
+{
+    ImageDocument document;
+    document.imagePath = m_currentImagePath;
+    document.projectPath = m_currentProjectPath;
+    document.projectCreatedDate = m_projectCreatedDate;
+    document.projectModifiedDate = m_projectModifiedDate;
+    document.originalFullRes = m_originalFullRes;
+    document.previewSource = m_previewSource;
+    document.processed = m_processed;
+    document.look = m_look;
+    document.dirty = m_projectDirty;
+    document.undoStack = m_undoStack;
+    document.redoStack = m_redoStack;
+    document.historyEntries = m_historyEntries;
+    document.historyCurrentIndex = m_historyCurrentIndex;
+    document.nextHistoryLabel = m_nextHistoryLabel;
+    document.selectedMaskIndex = m_selectedMaskIndex;
+    document.selectedLayerIndex = m_selectedLayerIndex;
+    return document;
+}
+
+MainWindow::ImageDocument* MainWindow::activeDocument()
+{
+    if (m_activeDocumentIndex < 0 ||
+        m_activeDocumentIndex >= static_cast<int>(m_documents.size())) {
+        return nullptr;
+    }
+    return &m_documents[static_cast<size_t>(m_activeDocumentIndex)];
+}
+
+const MainWindow::ImageDocument* MainWindow::activeDocument() const
+{
+    if (m_activeDocumentIndex < 0 ||
+        m_activeDocumentIndex >= static_cast<int>(m_documents.size())) {
+        return nullptr;
+    }
+    return &m_documents[static_cast<size_t>(m_activeDocumentIndex)];
+}
+
+QString MainWindow::documentTitle(const ImageDocument& document) const
+{
+    if (!document.projectPath.isEmpty())
+        return QFileInfo(document.projectPath).fileName();
+    if (!document.imagePath.isEmpty())
+        return QFileInfo(document.imagePath).fileName();
+    return tr("Untitled");
+}
+
+void MainWindow::saveActiveDocumentState()
+{
+    if (m_restoringDocument || m_isLoadingProject)
+        return;
+    if (m_debounce && m_debounce->isActive() && !m_isLoadingProject) {
+        m_projectDirty = true;
+        if (m_historyCurrentIndex >= 0 &&
+            m_historyCurrentIndex < static_cast<int>(m_historyEntries.size())) {
+            m_historyEntries[static_cast<size_t>(m_historyCurrentIndex)].snapshot = m_look;
+        }
+        scheduleAutosave();
+    }
+    if (auto* document = activeDocument())
+        *document = makeDocumentFromCurrentState();
+}
+
+int MainWindow::appendCurrentStateAsDocument()
+{
+    m_documents.push_back(makeDocumentFromCurrentState());
+    m_activeDocumentIndex = static_cast<int>(m_documents.size()) - 1;
+    updateDocumentTabs();
+    return m_activeDocumentIndex;
+}
+
+bool MainWindow::setActiveDocumentIndex(int index)
+{
+    if (index < 0 || index >= static_cast<int>(m_documents.size()))
+        return false;
+    if (index == m_activeDocumentIndex) {
+        updateDocumentTabs();
+        return true;
+    }
+
+    saveActiveDocumentState();
+    m_activeDocumentIndex = index;
+
+    const ImageDocument& document = m_documents[static_cast<size_t>(index)];
+    ++m_generation;
+    m_pendingRender = false;
+    m_showOriginal = false;
+
+    m_restoringDocument = true;
+    m_isLoadingProject = true;
+
+    m_currentImagePath = document.imagePath;
+    m_currentProjectPath = document.projectPath;
+    m_projectCreatedDate = document.projectCreatedDate;
+    m_projectModifiedDate = document.projectModifiedDate;
+    m_originalFullRes = document.originalFullRes;
+    m_previewSource = document.previewSource;
+    m_processed = document.processed;
+    m_look = document.look;
+    m_projectDirty = document.dirty;
+    m_undoStack = document.undoStack;
+    m_redoStack = document.redoStack;
+    m_historyEntries = document.historyEntries;
+    m_historyCurrentIndex = document.historyCurrentIndex;
+    m_nextHistoryLabel = document.nextHistoryLabel;
+    m_selectedMaskIndex = document.selectedMaskIndex;
+    m_selectedLayerIndex = document.selectedLayerIndex;
+
+    if (m_previewLabel) {
+        m_previewLabel->setCropOverlayActive(false);
+        m_previewLabel->setShowOriginal(false);
+    }
+    if (m_cropToolBtn) {
+        QSignalBlocker block(m_cropToolBtn);
+        m_cropToolBtn->setChecked(false);
+    }
+
+    applyLookToUi();
+    if (m_debounce) m_debounce->stop();
+
+    m_isLoadingProject = false;
+    m_restoringDocument = false;
+
+    refreshUndoRedoActions();
+    refreshHistoryList();
+    updateMetadataPanel();
+    updateNavigatorPreview();
+
+    if (m_originalFullRes.isNull()) {
+        if (m_emptyState) m_emptyState->show();
+        if (m_histogramWidget) m_histogramWidget->setImage(QImage());
+        if (m_secondaryViewer) m_secondaryViewer->setImage(QImage());
+    } else {
+        if (m_emptyState) m_emptyState->hide();
+        if (m_histogramWidget)
+            m_histogramWidget->setImage(!m_processed.isNull() ? m_processed : m_previewSource);
+        if (m_secondaryViewer) m_secondaryViewer->setImage(m_processed);
+    }
+
+    refreshPreviewLabel();
+    if (m_processed.isNull() && !m_previewSource.isNull())
+        requestRender();
+
+    updateDocumentTabs();
+    updateWindowTitle();
+    showEditorWorkspace();
+    return true;
+}
+
+bool MainWindow::closeDocumentAt(int index)
+{
+    if (index < 0 || index >= static_cast<int>(m_documents.size()))
+        return false;
+
+    if (index == m_activeDocumentIndex)
+        saveActiveDocumentState();
+    if (!maybePromptSaveDocument(index))
+        return false;
+
+    int nextIndex = m_activeDocumentIndex;
+    if (index == m_activeDocumentIndex) {
+        nextIndex = index;
+    } else if (index < m_activeDocumentIndex) {
+        --nextIndex;
+    }
+
+    m_documents.erase(m_documents.begin() + index);
+    if (m_documents.empty()) {
+        m_activeDocumentIndex = -1;
+        clearEditorStateForNoDocuments();
+        return true;
+    }
+
+    if (nextIndex >= static_cast<int>(m_documents.size()))
+        nextIndex = static_cast<int>(m_documents.size()) - 1;
+    m_activeDocumentIndex = -1;
+    setActiveDocumentIndex(nextIndex);
+    return true;
+}
+
+void MainWindow::updateDocumentTabs()
+{
+    if (!m_documentTabs)
+        return;
+
+    m_syncingDocumentTabs = true;
+    while (m_documentTabs->count() > 0)
+        m_documentTabs->removeTab(0);
+
+    for (int i = 0; i < static_cast<int>(m_documents.size()); ++i) {
+        const ImageDocument& document = m_documents[static_cast<size_t>(i)];
+        QString title = documentTitle(document);
+        if (document.dirty)
+            title += QStringLiteral(" *");
+        m_documentTabs->addTab(title);
+        m_documentTabs->setTabToolTip(i, document.projectPath.isEmpty()
+            ? document.imagePath
+            : document.projectPath);
+    }
+
+    m_documentTabs->setVisible(!m_documents.empty());
+    if (m_activeDocumentIndex >= 0 &&
+        m_activeDocumentIndex < m_documentTabs->count()) {
+        m_documentTabs->setCurrentIndex(m_activeDocumentIndex);
+    }
+    m_syncingDocumentTabs = false;
+}
+
+void MainWindow::clearEditorStateForNoDocuments()
+{
+    ++m_generation;
+    m_pendingRender = false;
+    m_showOriginal = false;
+    m_currentImagePath.clear();
+    m_currentProjectPath.clear();
+    m_projectCreatedDate = QDateTime();
+    m_projectModifiedDate = QDateTime();
+    m_originalFullRes = QImage();
+    m_previewSource = QImage();
+    m_processed = QImage();
+    m_look = lps::Look{};
+    m_projectDirty = false;
+    m_undoStack.clear();
+    m_redoStack.clear();
+    m_historyEntries.clear();
+    m_historyCurrentIndex = -1;
+    m_nextHistoryLabel.clear();
+    m_selectedMaskIndex = -1;
+    m_selectedLayerIndex = -1;
+
+    m_isLoadingProject = true;
+    applyLookToUi();
+    if (m_debounce) m_debounce->stop();
+    m_isLoadingProject = false;
+
+    refreshUndoRedoActions();
+    refreshHistoryList();
+    updateMetadataPanel();
+    updateNavigatorPreview();
+    if (m_histogramWidget) m_histogramWidget->setImage(QImage());
+    if (m_previewLabel) {
+        m_previewLabel->setCropOverlayActive(false);
+        m_previewLabel->setOriginalImage(QImage());
+        m_previewLabel->setEditedImage(QImage());
+        m_previewLabel->setShowOriginal(false);
+        m_previewLabel->zoomToFit();
+    }
+    if (m_secondaryViewer) m_secondaryViewer->setImage(QImage());
+    if (m_emptyState) m_emptyState->show();
+    updateDocumentTabs();
+    updateWindowTitle();
+    showWelcomeScreen();
+}
+
+void MainWindow::updateBottomWorkspaceVisibility()
+{
+    if (!m_nodeGraphDock) return;
+
+    m_syncingBottomWorkspaceVisibility = true;
+    m_nodeGraphDock->setVisible(m_editorWorkspaceActive && m_bottomWorkspaceEnabled);
+    m_syncingBottomWorkspaceVisibility = false;
+
+    if (m_actShowBottomWorkspace) {
+        QSignalBlocker block(m_actShowBottomWorkspace);
+        m_actShowBottomWorkspace->setChecked(m_bottomWorkspaceEnabled);
+    }
+}
+
+void MainWindow::setBottomWorkspaceCollapsed(bool collapsed)
+{
+    m_bottomWorkspaceCollapsed = collapsed;
+    if (m_settings)
+        m_settings->setBottomWorkspaceCollapsed(collapsed);
+    if (m_bottomPanelTabs)
+        m_bottomPanelTabs->setVisible(!collapsed);
+
+    if (m_bottomWorkspaceCollapseBtn) {
+        m_bottomWorkspaceCollapseBtn->setText(collapsed
+            ? QStringLiteral("^")
+            : QStringLiteral("v"));
+        m_bottomWorkspaceCollapseBtn->setToolTip(collapsed
+            ? tr("Expand bottom workspace")
+            : tr("Collapse bottom workspace"));
+    }
+
+    if (m_nodeGraphDock) {
+        m_nodeGraphDock->setMinimumHeight(collapsed ? 56 : 180);
+        m_nodeGraphDock->setMaximumHeight(collapsed ? 76 : QWIDGETSIZE_MAX);
+    }
+}
+
+void MainWindow::refreshWelcomeRecentFiles()
+{
+    if (!m_welcomeScreen || !m_settings) return;
+    m_welcomeScreen->setRecentItems(m_settings->recentImages(),
+                                    m_settings->recentProjects());
+}
+
+QWidget* MainWindow::buildAnalysisPanel()
+{
+    auto* outer = new QWidget(this);
+    outer->setObjectName(QStringLiteral("analysisPanel"));
+    outer->setMinimumWidth(230);
+    outer->setMaximumWidth(260);
+
+    auto* outerLay = new QVBoxLayout(outer);
+    outerLay->setContentsMargins(0, 0, 0, 0);
+    outerLay->setSpacing(0);
+
+    auto* header = new QWidget(outer);
+    header->setObjectName(QStringLiteral("analysisHeader"));
+    auto* headerLay = new QHBoxLayout(header);
+    headerLay->setContentsMargins(10, 7, 8, 7);
+    headerLay->setSpacing(6);
+
+    auto* title = new QLabel(tr("Analysis"), header);
+    QFont titleFont = title->font();
+    titleFont.setBold(true);
+    title->setFont(titleFont);
+    title->setStyleSheet("color: #E7E9EE;");
+    headerLay->addWidget(title);
+    headerLay->addStretch(1);
+
+    m_analysisCollapseBtn = new QToolButton(header);
+    m_analysisCollapseBtn->setText(QStringLiteral("<"));
+    m_analysisCollapseBtn->setToolTip(tr("Collapse analysis panel"));
+    m_analysisCollapseBtn->setCursor(Qt::PointingHandCursor);
+    m_analysisCollapseBtn->setFixedSize(28, 24);
+    m_analysisCollapseBtn->setProperty("navButton", true);
+    connect(m_analysisCollapseBtn, &QToolButton::clicked, this,
+            [this]() { setAnalysisPanelCollapsed(true); });
+    headerLay->addWidget(m_analysisCollapseBtn);
+    outerLay->addWidget(header);
+
+    m_analysisScroll = new QScrollArea(outer);
+    m_analysisScroll->setObjectName(QStringLiteral("analysisScroll"));
+    m_analysisScroll->setWidgetResizable(true);
+    m_analysisScroll->setFrameShape(QFrame::NoFrame);
+
+    auto* panel = new QWidget(m_analysisScroll);
+    panel->setObjectName(QStringLiteral("analysisBody"));
+    auto* col = new QVBoxLayout(panel);
+    col->setContentsMargins(10, 10, 10, 12);
+    col->setSpacing(10);
+
+    auto makeCard = [panel]() {
+        auto* card = new QFrame(panel);
+        card->setObjectName(QStringLiteral("analysisCard"));
+        auto* lay = new QVBoxLayout(card);
+        lay->setContentsMargins(10, 9, 10, 10);
+        lay->setSpacing(7);
+        return std::pair<QFrame*, QVBoxLayout*>(card, lay);
+    };
+
+    auto makeCardTitle = [](const QString& text, QWidget* parent) {
+        auto* row = new QWidget(parent);
+        auto* lay = new QHBoxLayout(row);
+        lay->setContentsMargins(0, 0, 0, 0);
+        lay->setSpacing(6);
+        auto* label = new QLabel(text, row);
+        QFont font = label->font();
+        font.setBold(true);
+        label->setFont(font);
+        label->setStyleSheet("color: #E7E9EE;");
+        lay->addWidget(label);
+        lay->addStretch(1);
+        auto* dots = new QLabel(QStringLiteral("..."), row);
+        dots->setStyleSheet("color: #9EA4AE;");
+        lay->addWidget(dots);
+        return row;
+    };
+
+    {
+        auto [card, lay] = makeCard();
+        lay->addWidget(makeCardTitle(tr("Histogram"), card));
+        m_histogramWidget = new HistogramWidget(card);
+        m_histogramWidget->setMinimumHeight(110);
+        lay->addWidget(m_histogramWidget);
+        col->addWidget(card);
+    }
+
+    {
+        auto [card, lay] = makeCard();
+        lay->addWidget(makeCardTitle(tr("Navigator"), card));
+
+        m_navigatorPreview = new QLabel(card);
+        m_navigatorPreview->setObjectName(QStringLiteral("navigatorPreview"));
+        m_navigatorPreview->setAlignment(Qt::AlignCenter);
+        m_navigatorPreview->setMinimumHeight(120);
+        m_navigatorPreview->setText(tr("No image"));
+        m_navigatorPreview->setStyleSheet("color: #7A7A7A;");
+        lay->addWidget(m_navigatorPreview);
+
+        auto* zoomRow = new QWidget(card);
+        auto* zoomLay = new QHBoxLayout(zoomRow);
+        zoomLay->setContentsMargins(0, 0, 0, 0);
+        zoomLay->setSpacing(4);
+        auto addZoomButton = [this, zoomLay, zoomRow](const QString& text,
+                                                       void (MainWindow::*slot)()) {
+            auto* btn = new QPushButton(text, zoomRow);
+            btn->setCursor(Qt::PointingHandCursor);
+            btn->setMinimumWidth(40);
+            connect(btn, &QPushButton::clicked, this, slot);
+            zoomLay->addWidget(btn);
+        };
+        addZoomButton(tr("Fit"),  &MainWindow::onZoomFit);
+        addZoomButton(tr("Fill"), &MainWindow::onZoomFit);
+        addZoomButton(tr("1:1"),  &MainWindow::onZoom100);
+        addZoomButton(tr("100%"), &MainWindow::onZoom100);
+        lay->addWidget(zoomRow);
+
+        col->addWidget(card);
+    }
+
+    {
+        auto [card, lay] = makeCard();
+        lay->addWidget(makeCardTitle(tr("Metadata"), card));
+
+        auto addMetadataRow = [lay, card](const QString& name,
+                                          QLabel*& valueLabel) {
+            auto* row = new QWidget(card);
+            auto* rowLay = new QHBoxLayout(row);
+            rowLay->setContentsMargins(0, 0, 0, 0);
+            rowLay->setSpacing(8);
+
+            auto* nameLabel = new QLabel(name, row);
+            nameLabel->setObjectName(QStringLiteral("metadataName"));
+            nameLabel->setMinimumWidth(82);
+            rowLay->addWidget(nameLabel, 0);
+
+            valueLabel = new QLabel(QStringLiteral("--"), row);
+            valueLabel->setObjectName(QStringLiteral("metadataValue"));
+            valueLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+            valueLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+            rowLay->addWidget(valueLabel, 1);
+
+            lay->addWidget(row);
+        };
+
+        addMetadataRow(tr("File Name"),      m_metaFileName);
+        addMetadataRow(tr("Dimensions"),     m_metaDimensions);
+        addMetadataRow(tr("Date Time"),      m_metaDateTime);
+        addMetadataRow(tr("ISO"),            m_metaIso);
+        addMetadataRow(tr("Focal Length"),   m_metaFocalLength);
+        addMetadataRow(tr("Aperture"),       m_metaAperture);
+        addMetadataRow(tr("Shutter Speed"),  m_metaShutterSpeed);
+        addMetadataRow(tr("Camera Model"),   m_metaCameraModel);
+        addMetadataRow(tr("Lens Model"),     m_metaLensModel);
+
+        col->addWidget(card);
+    }
+
+    col->addStretch(1);
+    m_analysisScroll->setWidget(panel);
+    outerLay->addWidget(m_analysisScroll, 1);
+
+    updateMetadataPanel();
+    updateNavigatorPreview();
+    return outer;
 }
 
 QWidget* MainWindow::buildControlPanel()
@@ -342,6 +1541,7 @@ QWidget* MainWindow::buildControlPanel()
     // keeps the collapse toggle pinned at the top regardless of how far
     // the user has scrolled inside the controls.
     auto* outer = new QWidget(this);
+    outer->setObjectName(QStringLiteral("controlPanelCard"));
     auto* outerLay = new QVBoxLayout(outer);
     outerLay->setContentsMargins(0, 0, 0, 0);
     outerLay->setSpacing(0);
@@ -349,8 +1549,9 @@ QWidget* MainWindow::buildControlPanel()
     // ---- Header row with collapse toggle ----------------------------------
     {
         auto* header = new QWidget(outer);
+        header->setObjectName(QStringLiteral("controlHeader"));
         auto* headerLay = new QHBoxLayout(header);
-        headerLay->setContentsMargins(4, 4, 4, 4);
+        headerLay->setContentsMargins(8, 7, 8, 7);
         headerLay->addStretch(1);
 
         auto* collapseBtn = new QToolButton(header);
@@ -358,6 +1559,7 @@ QWidget* MainWindow::buildControlPanel()
         collapseBtn->setToolTip(tr("Collapse controls panel"));
         collapseBtn->setCursor(Qt::PointingHandCursor);
         collapseBtn->setFixedSize(28, 24);
+        collapseBtn->setProperty("navButton", true);
         connect(collapseBtn, &QToolButton::clicked,
                 this, &MainWindow::onToggleSidebar);
         headerLay->addWidget(collapseBtn);
@@ -367,13 +1569,16 @@ QWidget* MainWindow::buildControlPanel()
     // ---- Scrollable content area ------------------------------------------
     // Scrollable so the controls don't get clipped on short windows.
     auto* scroll = new QScrollArea(outer);
+    scroll->setObjectName(QStringLiteral("controlScroll"));
     scroll->setWidgetResizable(true);
     scroll->setFrameShape(QFrame::NoFrame);
+    m_controlScroll = scroll;
 
     auto* panel = new QWidget(scroll);
+    panel->setObjectName(QStringLiteral("controlPanelBody"));
     auto* col = new QVBoxLayout(panel);
-    col->setContentsMargins(4, 4, 4, 4);
-    col->setSpacing(6);
+    col->setContentsMargins(12, 10, 12, 12);
+    col->setSpacing(8);
 
     // ---- View mode readout ------------------------------------------------
     // Shows "Edited" by default, "Original" while Spacebar is held down.
@@ -391,28 +1596,14 @@ QWidget* MainWindow::buildControlPanel()
     col->addWidget(sep);
 
     // Bold font used for every section header (TONE, COLOR, HSL, CURVES,
-    // HISTOGRAM). Hoisted to the top so we can reuse it across sections
+    // etc.). Hoisted to the top so we can reuse it across sections
     // without repeating the QFont setup.
     QFont hf = panel->font();
     hf.setBold(true);
 
-    // ---- Section: HISTOGRAM -----------------------------------------------
-    // Lives at the top of the panel so users see live histogram feedback
-    // alongside whatever section they're scrolled to. The widget itself is
-    // ~80 px tall; setImage() recomputes bins after every preview render.
-    {
-        auto* histHeader = new QLabel(tr("HISTOGRAM"), panel);
-        histHeader->setFont(hf);
-        histHeader->setStyleSheet("color: #9A9AA0; padding-top: 4px;");
-        col->addWidget(histHeader);
-
-        m_histogramWidget = new HistogramWidget(panel);
-        m_histogramWidget->setMinimumHeight(80);
-        col->addWidget(m_histogramWidget);
-    }
-
     // ---- Section header ----------------------------------------------------
     auto* toneHeader = new QLabel(tr("TONE"), panel);
+    m_toneSection = toneHeader;
     toneHeader->setFont(hf);
     toneHeader->setStyleSheet("color: #9A9AA0; padding-top: 4px;");
     col->addWidget(toneHeader);
@@ -451,6 +1642,7 @@ QWidget* MainWindow::buildControlPanel()
 
     // ---- Section header: COLOR --------------------------------------------
     auto* colorHeader = new QLabel(tr("COLOR"), panel);
+    m_colorSection = colorHeader;
     colorHeader->setFont(hf);   // reuse the bold font set up for TONE
     colorHeader->setStyleSheet("color: #9A9AA0; padding-top: 4px;");
     col->addWidget(colorHeader);
@@ -481,6 +1673,7 @@ QWidget* MainWindow::buildControlPanel()
     // Eight buttons replace what used to be 24 sliders; the three sliders
     // are shared across channels and re-populated on selection change.
     auto* hslHeader = new QLabel(tr("HSL"), panel);
+    m_hslSection = hslHeader;
     hslHeader->setFont(hf);
     hslHeader->setStyleSheet("color: #9A9AA0; padding-top: 4px;");
     col->addWidget(hslHeader);
@@ -572,6 +1765,7 @@ QWidget* MainWindow::buildControlPanel()
     // buttons switch which CurvePoints the editor is mutating; one widget
     // handles all four channels.
     auto* curvesHeader = new QLabel(tr("CURVES"), panel);
+    m_curvesSection = curvesHeader;
     curvesHeader->setFont(hf);
     curvesHeader->setStyleSheet("color: #9A9AA0; padding-top: 4px;");
     col->addWidget(curvesHeader);
@@ -626,6 +1820,7 @@ QWidget* MainWindow::buildControlPanel()
     // twice (shouldn't happen, but defensively).
     connect(m_curveEditor, &CurveEditorWidget::editStarted, this, [this]() {
         if (m_curveDragUndoCaptured) return;
+        m_nextHistoryLabel = tr("Curve changed");
         pushUndoSnapshot();
         m_curveDragUndoCaptured = true;
     });
@@ -639,6 +1834,7 @@ QWidget* MainWindow::buildControlPanel()
     // multiplier; this section just exposes those two parameters in the
     // UI plus Load/Clear buttons.
     auto* gradingHeader = new QLabel(tr("COLOR GRADING"), panel);
+    m_gradingSection = gradingHeader;
     gradingHeader->setFont(hf);
     gradingHeader->setStyleSheet("color: #9A9AA0; padding-top: 4px;");
     col->addWidget(gradingHeader);
@@ -696,6 +1892,7 @@ QWidget* MainWindow::buildControlPanel()
         m_lutEnabledCheck->setCursor(Qt::PointingHandCursor);
         connect(m_lutEnabledCheck, &QCheckBox::toggled, this, [this](bool on) {
             if (m_look.grading.lutEnabled == on) return;
+            m_nextHistoryLabel = tr("LUT enabled changed");
             pushUndoSnapshot();
             m_look.grading.lutEnabled = on;
             refreshUndoRedoActions();
@@ -931,15 +2128,382 @@ QWidget* MainWindow::buildControlPanel()
     // Initialize LUT widgets from the (default-empty) Look.
     refreshLutWidgets();
 
+    // ---- Section header: TRANSFORM ---------------------------------------
+    {
+        auto* transformHeader = new QLabel(tr("TRANSFORM"), panel);
+        m_transformSection = transformHeader;
+        transformHeader->setFont(hf);
+        transformHeader->setStyleSheet("color: #9A9AA0; padding-top: 4px;");
+        col->addWidget(transformHeader);
+
+        auto makeButton = [panel](const QString& text) {
+            auto* btn = new QPushButton(text, panel);
+            btn->setCursor(Qt::PointingHandCursor);
+            return btn;
+        };
+
+        m_cropToolBtn = makeButton(tr("Crop Tool"));
+        m_cropToolBtn->setCheckable(true);
+        col->addWidget(m_cropToolBtn);
+
+        auto* cropOptionsRow = new QWidget(panel);
+        auto* cropOptionsLay = new QHBoxLayout(cropOptionsRow);
+        cropOptionsLay->setContentsMargins(0, 0, 0, 0);
+        cropOptionsLay->setSpacing(6);
+
+        m_cropAspectCombo = new QComboBox(panel);
+        m_cropAspectCombo->addItems(QStringList{
+            tr("Free"),
+            tr("Original"),
+            tr("1:1"),
+            tr("4:5"),
+            tr("5:4"),
+            tr("3:2"),
+            tr("2:3"),
+            tr("16:9"),
+            tr("9:16"),
+        });
+        cropOptionsLay->addWidget(m_cropAspectCombo, 1);
+
+        m_cropLockAspectCheck = new QCheckBox(tr("Lock"), panel);
+        m_cropLockAspectCheck->setCursor(Qt::PointingHandCursor);
+        cropOptionsLay->addWidget(m_cropLockAspectCheck);
+        col->addWidget(cropOptionsRow);
+
+        auto* resetCropBtn = makeButton(tr("Reset Crop"));
+        col->addWidget(resetCropBtn);
+
+        auto* rotateRow = new QWidget(panel);
+        auto* rotateLay = new QHBoxLayout(rotateRow);
+        rotateLay->setContentsMargins(0, 0, 0, 0);
+        rotateLay->setSpacing(6);
+
+        auto* rotateLeftBtn = makeButton(tr("Rotate Left"));
+        auto* rotateRightBtn = makeButton(tr("Rotate Right"));
+        rotateLay->addWidget(rotateLeftBtn);
+        rotateLay->addWidget(rotateRightBtn);
+        col->addWidget(rotateRow);
+
+        auto* flipRow = new QWidget(panel);
+        auto* flipLay = new QHBoxLayout(flipRow);
+        flipLay->setContentsMargins(0, 0, 0, 0);
+        flipLay->setSpacing(6);
+
+        m_transformFlipHorizontalBtn = makeButton(tr("Flip H"));
+        m_transformFlipHorizontalBtn->setCheckable(true);
+        m_transformFlipVerticalBtn = makeButton(tr("Flip V"));
+        m_transformFlipVerticalBtn->setCheckable(true);
+        flipLay->addWidget(m_transformFlipHorizontalBtn);
+        flipLay->addWidget(m_transformFlipVerticalBtn);
+        col->addWidget(flipRow);
+
+        col->addWidget(buildSliderRow(tr("Straighten"),
+                                      -100, 100, 0,
+                                      m_straightenSlider,
+                                      m_straightenValue));
+
+        auto* resetTransformBtn = makeButton(tr("Reset Transform"));
+        col->addWidget(resetTransformBtn);
+
+        connect(rotateLeftBtn, &QPushButton::clicked,
+                this, &MainWindow::onRotateLeft);
+        connect(rotateRightBtn, &QPushButton::clicked,
+                this, &MainWindow::onRotateRight);
+        connect(m_transformFlipHorizontalBtn, &QPushButton::clicked,
+                this, &MainWindow::onFlipHorizontal);
+        connect(m_transformFlipVerticalBtn, &QPushButton::clicked,
+                this, &MainWindow::onFlipVertical);
+        connect(resetTransformBtn, &QPushButton::clicked,
+                this, &MainWindow::onResetTransform);
+        connect(m_cropToolBtn, &QPushButton::toggled,
+                this, [this](bool on) {
+            if (!m_previewLabel) return;
+            m_previewLabel->setCropRect(m_look.transform.cropRect);
+            updateCropAspectConstraint();
+            m_previewLabel->setCropOverlayActive(on);
+        });
+        connect(m_cropAspectCombo,
+                qOverload<int>(&QComboBox::currentIndexChanged),
+                this, [this](int) { updateCropAspectConstraint(); });
+        connect(m_cropLockAspectCheck, &QCheckBox::toggled,
+                this, [this](bool) { updateCropAspectConstraint(); });
+        connect(resetCropBtn, &QPushButton::clicked,
+                this, [this]() {
+            const QRectF identity(0.0, 0.0, 1.0, 1.0);
+            if (m_look.transform.cropRect == identity) return;
+            m_nextHistoryLabel = tr("Crop changed");
+            pushUndoSnapshot();
+            m_look.transform.cropRect = identity;
+            if (m_previewLabel)
+                m_previewLabel->setCropRect(m_look.transform.cropRect);
+            refreshTransformWidgets();
+            if (m_debounce) m_debounce->start();
+        });
+
+        connect(m_straightenSlider, &QSlider::sliderPressed,
+                this, &MainWindow::pushUndoSnapshot);
+        connect(m_straightenSlider, &QSlider::valueChanged,
+                this, [this](int v) {
+            const float angle = static_cast<float>(v) / 10.0f;
+            m_look.transform.straightenAngle = angle;
+            if (m_straightenValue)
+                m_straightenValue->setText(QString::number(angle, 'f', 1));
+            if (m_debounce) m_debounce->start();
+        });
+
+        refreshTransformWidgets();
+    }
+
+    // ---- Section header: HDR TONE MAPPING --------------------------------
+    {
+        auto* hdrHeader = new QLabel(tr("HDR"), panel);
+        hdrHeader->setFont(hf);
+        hdrHeader->setStyleSheet("color: #9A9AA0; padding-top: 4px;");
+        col->addWidget(hdrHeader);
+
+        m_hdrEnabledCheck = new QCheckBox(tr("Enable HDR Tone Mapping"), panel);
+        m_hdrEnabledCheck->setCursor(Qt::PointingHandCursor);
+        connect(m_hdrEnabledCheck, &QCheckBox::toggled, this, [this](bool on) {
+            if (m_look.hdr.enabled == on) return;
+            m_nextHistoryLabel = tr("HDR tone mapping changed");
+            pushUndoSnapshot();
+            m_look.hdr.enabled = on;
+            refreshHdrWidgets();
+            refreshUndoRedoActions();
+            markDirty();
+            if (m_debounce) m_debounce->start();
+        });
+        col->addWidget(m_hdrEnabledCheck);
+
+        col->addWidget(buildSliderRow(tr("Exposure Bias"),
+                                      -500, 500, 0,
+                                      m_hdrExposureBiasSlider,
+                                      m_hdrExposureBiasValue));
+        col->addWidget(buildSliderRow(tr("Highlight Compression"),
+                                      0, 100, 50,
+                                      m_hdrHighlightCompressionSlider,
+                                      m_hdrHighlightCompressionValue));
+        col->addWidget(buildSliderRow(tr("Shoulder Strength"),
+                                      0, 100, 50,
+                                      m_hdrShoulderStrengthSlider,
+                                      m_hdrShoulderStrengthValue));
+        col->addWidget(buildSliderRow(tr("Midtone Pivot"),
+                                      5, 100, 18,
+                                      m_hdrMidtonePivotSlider,
+                                      m_hdrMidtonePivotValue));
+        col->addWidget(buildSliderRow(tr("Saturation Preserve"),
+                                      0, 100, 85,
+                                      m_hdrSaturationPreserveSlider,
+                                      m_hdrSaturationPreserveValue));
+
+        auto wireHdr = [this](QSlider* slider, QLabel* lbl,
+                              float lps::HDRParams::* field,
+                              float scale, int decimals) {
+            connect(slider, &QSlider::sliderPressed,
+                    this, &MainWindow::pushUndoSnapshot);
+            connect(slider, &QSlider::valueChanged, this,
+                    [this, lbl, field, scale, decimals](int v) {
+                const float value = static_cast<float>(v) / scale;
+                m_look.hdr.*field = value;
+                if (lbl) lbl->setText(QString::number(value, 'f', decimals));
+                if (m_debounce) m_debounce->start();
+            });
+        };
+
+        wireHdr(m_hdrExposureBiasSlider, m_hdrExposureBiasValue,
+                &lps::HDRParams::exposureBias, 100.0f, 2);
+        wireHdr(m_hdrHighlightCompressionSlider, m_hdrHighlightCompressionValue,
+                &lps::HDRParams::highlightCompression, 1.0f, 0);
+        wireHdr(m_hdrShoulderStrengthSlider, m_hdrShoulderStrengthValue,
+                &lps::HDRParams::shoulderStrength, 1.0f, 0);
+        wireHdr(m_hdrMidtonePivotSlider, m_hdrMidtonePivotValue,
+                &lps::HDRParams::midtonePivot, 100.0f, 2);
+        wireHdr(m_hdrSaturationPreserveSlider, m_hdrSaturationPreserveValue,
+                &lps::HDRParams::saturationPreserve, 1.0f, 0);
+
+        refreshHdrWidgets();
+    }
+
+    // ---- Section header: LENS CORRECTION ---------------------------------
+    // Master enable + per-control sliders. Vignetting is engine-active
+    // in V1; distortion / CA / fringe are placeholders (UI persists,
+    // engine ignores them — they round-trip through save/load).
+    {
+        auto* lensHeader = new QLabel(tr("LENS CORRECTION"), panel);
+        m_lensSection = lensHeader;
+        lensHeader->setFont(hf);
+        lensHeader->setStyleSheet("color: #9A9AA0; padding-top: 4px;");
+        col->addWidget(lensHeader);
+
+        m_lensEnabledCheck = new QCheckBox(tr("Enable Lens Corrections"), panel);
+        m_lensEnabledCheck->setCursor(Qt::PointingHandCursor);
+        connect(m_lensEnabledCheck, &QCheckBox::toggled, this, [this](bool on) {
+            if (m_look.lens.enabled == on) return;
+            m_nextHistoryLabel = tr("Lens correction changed");
+            pushUndoSnapshot();
+            m_look.lens.enabled = on;
+            refreshLensWidgets();
+            refreshUndoRedoActions();
+            markDirty();
+            if (m_debounce) m_debounce->start();
+        });
+        col->addWidget(m_lensEnabledCheck);
+
+        m_lensRemoveCaCheck = new QCheckBox(tr("Remove Chromatic Aberration"), panel);
+        m_lensRemoveCaCheck->setCursor(Qt::PointingHandCursor);
+        connect(m_lensRemoveCaCheck, &QCheckBox::toggled, this, [this](bool on) {
+            if (m_look.lens.removeChromaticAberration == on) return;
+            m_nextHistoryLabel = tr("Lens correction changed");
+            pushUndoSnapshot();
+            m_look.lens.removeChromaticAberration = on;
+            refreshUndoRedoActions();
+            markDirty();
+            // CA is a placeholder in V1 — toggling it doesn't change pixels,
+            // but kicking the debounce keeps the dirty/undo machinery
+            // consistent with other lens controls.
+            if (m_debounce) m_debounce->start();
+        });
+        col->addWidget(m_lensRemoveCaCheck);
+
+        col->addWidget(buildSliderRow(tr("Distortion"),
+                                      -100, 100, 0,
+                                      m_lensDistortionSlider,
+                                      m_lensDistortionValue));
+        col->addWidget(buildSliderRow(tr("Vignetting"),
+                                      -100, 100, 0,
+                                      m_lensVignettingSlider,
+                                      m_lensVignettingValue));
+        col->addWidget(buildSliderRow(tr("Purple Fringe"),
+                                      0, 100, 0,
+                                      m_lensPurpleFringeSlider,
+                                      m_lensPurpleFringeValue));
+        col->addWidget(buildSliderRow(tr("Green Fringe"),
+                                      0, 100, 0,
+                                      m_lensGreenFringeSlider,
+                                      m_lensGreenFringeValue));
+
+        // Wire each slider — same pattern as global tone sliders. One
+        // undo snapshot per drag (sliderPressed), debounce on each
+        // valueChanged.
+        auto wireLens = [this](QSlider* slider, QLabel* lbl,
+                               float lps::LensParams::* field) {
+            connect(slider, &QSlider::sliderPressed,
+                    this, &MainWindow::pushUndoSnapshot);
+            connect(slider, &QSlider::valueChanged, this,
+                    [this, lbl, field](int v) {
+                m_look.lens.*field = static_cast<float>(v);
+                if (lbl) lbl->setText(QString::number(v));
+                if (m_debounce) m_debounce->start();
+            });
+        };
+        wireLens(m_lensDistortionSlider,   m_lensDistortionValue,
+                 &lps::LensParams::distortion);
+        wireLens(m_lensVignettingSlider,   m_lensVignettingValue,
+                 &lps::LensParams::vignetting);
+        wireLens(m_lensPurpleFringeSlider, m_lensPurpleFringeValue,
+                 &lps::LensParams::purpleFringe);
+        wireLens(m_lensGreenFringeSlider,  m_lensGreenFringeValue,
+                 &lps::LensParams::greenFringe);
+
+        // Initial state — all sliders disabled until master enable is on.
+        refreshLensWidgets();
+    }
+
+    // ---- Section header: DETAILS -----------------------------------------
+    // Lightroom-style sharpening plus luminance/chroma noise reduction.
+    {
+        auto* detailsHeader = new QLabel(tr("DETAILS"), panel);
+        m_detailsSection = detailsHeader;
+        detailsHeader->setFont(hf);
+        detailsHeader->setStyleSheet("color: #9A9AA0; padding-top: 4px;");
+        col->addWidget(detailsHeader);
+
+        auto* sharpHeader = new QLabel(tr("Sharpening"), panel);
+        sharpHeader->setStyleSheet("color: #b0b0b6; padding-top: 2px;");
+        col->addWidget(sharpHeader);
+
+        col->addWidget(buildSliderRow(tr("Amount"),
+                                      0, 150, 0,
+                                      m_sharpeningAmountSlider,
+                                      m_sharpeningAmountValue));
+        col->addWidget(buildSliderRow(tr("Radius"),
+                                      5, 30, 10,
+                                      m_sharpeningRadiusSlider,
+                                      m_sharpeningRadiusValue));
+        col->addWidget(buildSliderRow(tr("Detail"),
+                                      0, 100, 0,
+                                      m_sharpeningDetailSlider,
+                                      m_sharpeningDetailValue));
+        col->addWidget(buildSliderRow(tr("Masking"),
+                                      0, 100, 0,
+                                      m_sharpeningMaskingSlider,
+                                      m_sharpeningMaskingValue));
+
+        auto* nrHeader = new QLabel(tr("Noise Reduction"), panel);
+        nrHeader->setStyleSheet("color: #b0b0b6; padding-top: 2px;");
+        col->addWidget(nrHeader);
+
+        col->addWidget(buildSliderRow(tr("Luminance"),
+                                      0, 100, 0,
+                                      m_luminanceNrSlider,
+                                      m_luminanceNrValue));
+        col->addWidget(buildSliderRow(tr("Lum Detail"),
+                                      0, 100, 0,
+                                      m_luminanceDetailSlider,
+                                      m_luminanceDetailValue));
+        col->addWidget(buildSliderRow(tr("Color NR"),
+                                      0, 100, 0,
+                                      m_colorNrSlider,
+                                      m_colorNrValue));
+        col->addWidget(buildSliderRow(tr("Color Detail"),
+                                      0, 100, 0,
+                                      m_colorDetailSlider,
+                                      m_colorDetailValue));
+
+        auto wireDetails = [this](QSlider* slider, QLabel* lbl,
+                                  float lps::DetailsParams::* field,
+                                  float scale, int decimals) {
+            connect(slider, &QSlider::sliderPressed,
+                    this, &MainWindow::pushUndoSnapshot);
+            connect(slider, &QSlider::valueChanged, this,
+                    [this, lbl, field, scale, decimals](int v) {
+                const float value = static_cast<float>(v) / scale;
+                m_look.details.*field = value;
+                if (lbl) lbl->setText(QString::number(value, 'f', decimals));
+                if (m_debounce) m_debounce->start();
+            });
+        };
+
+        wireDetails(m_sharpeningAmountSlider,  m_sharpeningAmountValue,
+                    &lps::DetailsParams::sharpeningAmount, 1.0f, 0);
+        wireDetails(m_sharpeningRadiusSlider,  m_sharpeningRadiusValue,
+                    &lps::DetailsParams::sharpeningRadius, 10.0f, 1);
+        wireDetails(m_sharpeningDetailSlider,  m_sharpeningDetailValue,
+                    &lps::DetailsParams::sharpeningDetail, 1.0f, 0);
+        wireDetails(m_sharpeningMaskingSlider, m_sharpeningMaskingValue,
+                    &lps::DetailsParams::sharpeningMasking, 1.0f, 0);
+        wireDetails(m_luminanceNrSlider,       m_luminanceNrValue,
+                    &lps::DetailsParams::luminanceNR, 1.0f, 0);
+        wireDetails(m_luminanceDetailSlider,   m_luminanceDetailValue,
+                    &lps::DetailsParams::luminanceDetail, 1.0f, 0);
+        wireDetails(m_colorNrSlider,           m_colorNrValue,
+                    &lps::DetailsParams::colorNR, 1.0f, 0);
+        wireDetails(m_colorDetailSlider,       m_colorDetailValue,
+                    &lps::DetailsParams::colorDetail, 1.0f, 0);
+
+        refreshDetailsWidgets();
+    }
+
     // ---- Section header: MASKS --------------------------------------------
     // Lightroom-style local adjustments: linear gradient, radial gradient,
-    // and a brush placeholder. Each mask has six adjustment sliders that
+    // and real brush masks. Each mask has six adjustment sliders that
     // operate only where the mask weight > 0 (LocalAdjustmentEngine).
     //
     // Layout: three "Add" buttons → list of masks (with per-row checkbox)
     //       → delete button → six sliders for the selected mask.
     {
         auto* maskHeader = new QLabel(tr("MASKS"), panel);
+        m_masksSection = maskHeader;
         maskHeader->setFont(hf);
         maskHeader->setStyleSheet("color: #9A9AA0; padding-top: 4px;");
         col->addWidget(maskHeader);
@@ -964,7 +2528,7 @@ QWidget* MainWindow::buildControlPanel()
 
         m_maskAddBrushBtn = new QPushButton(tr("+ Brush"), panel);
         m_maskAddBrushBtn->setCursor(Qt::PointingHandCursor);
-        m_maskAddBrushBtn->setToolTip(tr("Add a brush mask (placeholder)"));
+        m_maskAddBrushBtn->setToolTip(tr("Add a brush mask"));
         connect(m_maskAddBrushBtn, &QPushButton::clicked,
                 this, &MainWindow::onAddBrushMask);
         addRow->addWidget(m_maskAddBrushBtn);
@@ -978,8 +2542,12 @@ QWidget* MainWindow::buildControlPanel()
         m_maskList->setMinimumHeight(80);
         m_maskList->setMaximumHeight(140);
         m_maskList->setStyleSheet(
-            "QListWidget { background-color: #1c1c1f; "
-            "              border: 1px solid #2a2a2e; }");
+            "QListWidget { background-color: #111318;"
+            "              border: 1px solid #2A2D35;"
+            "              border-radius: 8px; padding: 4px; }"
+            "QListWidget::item { padding: 5px 6px; border-radius: 5px; }"
+            "QListWidget::item:selected { background: rgba(204, 255, 0, 36);"
+            "                              color: #FFFFFF; }");
         connect(m_maskList, &QListWidget::itemSelectionChanged,
                 this, &MainWindow::onMaskListSelectionChanged);
         connect(m_maskList, &QListWidget::itemChanged,
@@ -1063,7 +2631,7 @@ QWidget* MainWindow::buildControlPanel()
         // ---- Geometry / structural mask controls ----------------------------
         // These edit WHERE the mask hits — name, enable-via-checkbox-row-above,
         // invert, feather (geometry softness), density (overall strength),
-        // flow (brush placeholder), reset geometry button.
+        // flow (brush painting rate), reset geometry button.
         {
             auto* row = new QHBoxLayout();
             row->setContentsMargins(0, 4, 0, 0);
@@ -1083,6 +2651,7 @@ QWidget* MainWindow::buildControlPanel()
                 auto& mask = m_look.localAdjustments[m_selectedMaskIndex];
                 const QString newName = m_maskNameEdit->text();
                 if (mask.name == newName) return;
+                m_nextHistoryLabel = tr("Mask renamed");
                 pushUndoSnapshot();
                 mask.name = newName;
                 refreshUndoRedoActions();
@@ -1103,6 +2672,7 @@ QWidget* MainWindow::buildControlPanel()
             }
             auto& mask = m_look.localAdjustments[m_selectedMaskIndex];
             if (mask.invert == on) return;
+            m_nextHistoryLabel = tr("Mask changed");
             pushUndoSnapshot();
             mask.invert = on;
             refreshUndoRedoActions();
@@ -1115,7 +2685,7 @@ QWidget* MainWindow::buildControlPanel()
 
         // Feather / Density / Flow sliders. Feather is shared with
         // LocalAdjustment::feather (engine reads it). Density scales overall
-        // mask strength. Flow is a brush placeholder.
+        // mask strength. Flow controls brush stroke buildup.
         col->addWidget(buildSliderRow(tr("Feather"),
                                       0, 100, 50,
                                       m_maskFeatherSlider, m_maskFeatherValue));
@@ -1125,6 +2695,9 @@ QWidget* MainWindow::buildControlPanel()
         col->addWidget(buildSliderRow(tr("Flow"),
                                       0, 100, 100,
                                       m_maskFlowSlider, m_maskFlowValue));
+        col->addWidget(buildSliderRow(tr("Brush Size"),
+                                      1, 200, 80,
+                                      m_maskBrushSizeSlider, m_maskBrushSizeValue));
 
         auto wireMaskGeoSlider = [this](QSlider* slider, QLabel* lbl,
                                          float lps::LocalAdjustment::* field,
@@ -1151,6 +2724,50 @@ QWidget* MainWindow::buildControlPanel()
                           &lps::LocalAdjustment::density, 100.0f);
         wireMaskGeoSlider(m_maskFlowSlider, m_maskFlowValue,
                           &lps::LocalAdjustment::flow, 100.0f);
+
+        connect(m_maskBrushSizeSlider, &QSlider::sliderPressed,
+                this, &MainWindow::pushUndoSnapshot);
+        connect(m_maskBrushSizeSlider, &QSlider::valueChanged,
+                this, [this](int v) {
+            if (m_selectedMaskIndex < 0 ||
+                m_selectedMaskIndex >= static_cast<int>(m_look.localAdjustments.size())) {
+                return;
+            }
+            auto& mask = m_look.localAdjustments[m_selectedMaskIndex];
+            if (mask.type != lps::MaskType::Brush) return;
+            mask.brushSize = static_cast<float>(v) / 1000.0f;
+            if (m_maskBrushSizeValue)
+                m_maskBrushSizeValue->setText(QString::number(v));
+            if (m_previewLabel) m_previewLabel->setActiveMask(&mask);
+            markDirty();
+        });
+
+        m_maskBrushEraseCheck = new QCheckBox(tr("Erase brush"), panel);
+        m_maskBrushEraseCheck->setCursor(Qt::PointingHandCursor);
+        m_maskBrushEraseCheck->setEnabled(false);
+        connect(m_maskBrushEraseCheck, &QCheckBox::toggled,
+                this, [this](bool on) {
+            if (m_selectedMaskIndex < 0 ||
+                m_selectedMaskIndex >= static_cast<int>(m_look.localAdjustments.size())) {
+                return;
+            }
+            auto& mask = m_look.localAdjustments[m_selectedMaskIndex];
+            if (mask.type != lps::MaskType::Brush || mask.brushEraseMode == on) return;
+            m_nextHistoryLabel = tr("Brush erase mode changed");
+            pushUndoSnapshot();
+            mask.brushEraseMode = on;
+            if (m_previewLabel) m_previewLabel->setActiveMask(&mask);
+            refreshUndoRedoActions();
+            markDirty();
+        });
+        col->addWidget(m_maskBrushEraseCheck);
+
+        m_maskResetBrushBtn = new QPushButton(tr("Reset Brush Mask"), panel);
+        m_maskResetBrushBtn->setCursor(Qt::PointingHandCursor);
+        m_maskResetBrushBtn->setEnabled(false);
+        connect(m_maskResetBrushBtn, &QPushButton::clicked,
+                this, &MainWindow::onResetBrushMask);
+        col->addWidget(m_maskResetBrushBtn);
 
         m_maskResetGeoBtn = new QPushButton(tr("Reset Mask Geometry"), panel);
         m_maskResetGeoBtn->setCursor(Qt::PointingHandCursor);
@@ -1225,6 +2842,7 @@ QWidget* MainWindow::buildControlPanel()
     // pick up rendering once the compositor lands.
     {
         auto* layerHeader = new QLabel(tr("LAYERS"), panel);
+        m_layersSection = layerHeader;
         layerHeader->setFont(hf);
         layerHeader->setStyleSheet("color: #9A9AA0; padding-top: 4px;");
         col->addWidget(layerHeader);
@@ -1263,8 +2881,12 @@ QWidget* MainWindow::buildControlPanel()
         m_layerList->setMinimumHeight(80);
         m_layerList->setMaximumHeight(140);
         m_layerList->setStyleSheet(
-            "QListWidget { background-color: #1c1c1f; "
-            "              border: 1px solid #2a2a2e; }");
+            "QListWidget { background-color: #111318;"
+            "              border: 1px solid #2A2D35;"
+            "              border-radius: 8px; padding: 4px; }"
+            "QListWidget::item { padding: 5px 6px; border-radius: 5px; }"
+            "QListWidget::item:selected { background: rgba(204, 255, 0, 36);"
+            "                              color: #FFFFFF; }");
         connect(m_layerList, &QListWidget::itemSelectionChanged,
                 this, &MainWindow::onLayerListSelectionChanged);
         connect(m_layerList, &QListWidget::itemChanged,
@@ -1471,7 +3093,7 @@ QWidget* MainWindow::buildSliderRow(const QString& label,
     auto* name = new QLabel(label, row);
     name->setMinimumWidth(74);
 
-    auto* slider = new QSlider(Qt::Horizontal, row);
+    auto* slider = new NoWheelSlider(Qt::Horizontal, row);
     slider->setRange(minValue, maxValue);
     slider->setValue(initialValue);
     slider->setTracking(true);   // valueChanged fires during drag
@@ -1490,6 +3112,155 @@ QWidget* MainWindow::buildSliderRow(const QString& label,
     outSlider = slider;
     outValueLabel = val;
     return row;
+}
+
+void MainWindow::setAnalysisPanelCollapsed(bool collapsed)
+{
+    m_analysisPanelCollapsed = collapsed;
+    if (m_settings)
+        m_settings->setAnalysisPanelCollapsed(collapsed);
+
+    if (m_analysisPanel) {
+        if (collapsed) {
+            m_analysisPanel->setMinimumWidth(0);
+            m_analysisPanel->setMaximumWidth(0);
+            m_analysisPanel->setVisible(false);
+        } else {
+            m_analysisPanel->setVisible(true);
+            m_analysisPanel->setMinimumWidth(230);
+            m_analysisPanel->setMaximumWidth(260);
+        }
+    }
+
+    if (m_analysisCollapseBtn) {
+        m_analysisCollapseBtn->setText(collapsed
+            ? QStringLiteral(">")
+            : QStringLiteral("<"));
+        m_analysisCollapseBtn->setToolTip(collapsed
+            ? tr("Expand analysis panel")
+            : tr("Collapse analysis panel"));
+    }
+}
+
+void MainWindow::scrollInspectorTo(QWidget* section)
+{
+    if (m_sidebarCollapsed)
+        onToggleSidebar();
+
+    if (m_sidebarHost) {
+        m_sidebarHost->setVisible(true);
+        m_sidebarHost->setMaximumWidth(QWIDGETSIZE_MAX);
+    }
+    if (m_sidebarStack && m_sidebarFull)
+        m_sidebarStack->setCurrentWidget(m_sidebarFull);
+
+    if (m_controlScroll && section)
+        m_controlScroll->ensureWidgetVisible(section, 0, 8);
+}
+
+void MainWindow::handleRailAction(const QString& action)
+{
+    const QString key = action.toLower();
+
+    if (key == QStringLiteral("library")) {
+        QMessageBox::information(this, tr("Library"),
+                                 tr("This feature isn't implemented yet."));
+    } else if (key == QStringLiteral("histogram")) {
+        setAnalysisPanelCollapsed(false);
+        if (m_histogramWidget) m_histogramWidget->setVisible(true);
+        if (m_actShowHistogram) {
+            QSignalBlocker block(m_actShowHistogram);
+            m_actShowHistogram->setChecked(true);
+        }
+        if (m_analysisScroll && m_histogramWidget)
+            m_analysisScroll->ensureWidgetVisible(m_histogramWidget, 0, 8);
+    } else if (key == QStringLiteral("tone")) {
+        scrollInspectorTo(m_toneSection);
+    } else if (key == QStringLiteral("color")) {
+        scrollInspectorTo(m_colorSection);
+    } else if (key == QStringLiteral("hsl")) {
+        scrollInspectorTo(m_hslSection);
+    } else if (key == QStringLiteral("curves")) {
+        scrollInspectorTo(m_curvesSection);
+    } else if (key == QStringLiteral("grading")) {
+        scrollInspectorTo(m_gradingSection);
+    } else if (key == QStringLiteral("lens")) {
+        scrollInspectorTo(m_lensSection);
+    } else if (key == QStringLiteral("details")) {
+        scrollInspectorTo(m_detailsSection);
+    } else if (key == QStringLiteral("masks")) {
+        scrollInspectorTo(m_masksSection);
+    } else if (key == QStringLiteral("layers")) {
+        if (m_bottomPanelTabs) m_bottomPanelTabs->setCurrentIndex(1);
+        m_bottomWorkspaceEnabled = true;
+        if (m_settings) m_settings->setBottomWorkspaceVisible(true);
+        setBottomWorkspaceCollapsed(false);
+        updateBottomWorkspaceVisibility();
+        scrollInspectorTo(m_layersSection);
+    } else if (key == QStringLiteral("nodes")) {
+        onShowNodeGraph();
+    } else if (key == QStringLiteral("export")) {
+        onExportImage();
+    }
+}
+
+void MainWindow::updateNavigatorPreview()
+{
+    if (!m_navigatorPreview) return;
+
+    const QImage image = !m_processed.isNull() ? m_processed : m_previewSource;
+    if (image.isNull()) {
+        m_navigatorPreview->clear();
+        m_navigatorPreview->setText(tr("No image"));
+        return;
+    }
+
+    QSize target = m_navigatorPreview->contentsRect().size();
+    if (target.width() < 16 || target.height() < 16)
+        target = QSize(200, 120);
+
+    m_navigatorPreview->setText(QString());
+    m_navigatorPreview->setPixmap(QPixmap::fromImage(image).scaled(
+        target, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+}
+
+void MainWindow::updateMetadataPanel()
+{
+    const QString missing = QString::fromUtf8("\xE2\x80\x94");
+    auto setValue = [](QLabel* label, const QString& value) {
+        if (label) label->setText(value);
+    };
+    auto display = [&missing](const QString& value) {
+        return value.trimmed().isEmpty() ? missing : value.trimmed();
+    };
+
+    if (m_originalFullRes.isNull()) {
+        setValue(m_metaFileName, missing);
+        setValue(m_metaDimensions, missing);
+        setValue(m_metaDateTime, missing);
+        setValue(m_metaIso, missing);
+        setValue(m_metaFocalLength, missing);
+        setValue(m_metaAperture, missing);
+        setValue(m_metaShutterSpeed, missing);
+        setValue(m_metaCameraModel, missing);
+        setValue(m_metaLensModel, missing);
+        return;
+    }
+
+    const QFileInfo fileInfo(m_currentImagePath);
+    const lps::ImageMetadata metadata =
+        lps::ImageMetadataReader::read(m_currentImagePath);
+
+    setValue(m_metaFileName, display(fileInfo.fileName()));
+    setValue(m_metaDimensions,
+             tr("%1 x %2").arg(m_originalFullRes.width()).arg(m_originalFullRes.height()));
+    setValue(m_metaDateTime, display(metadata.captureDateTime));
+    setValue(m_metaIso, display(metadata.iso));
+    setValue(m_metaFocalLength, display(metadata.focalLength));
+    setValue(m_metaAperture, display(metadata.aperture));
+    setValue(m_metaShutterSpeed, display(metadata.shutterSpeed));
+    setValue(m_metaCameraModel, display(metadata.cameraModel));
+    setValue(m_metaLensModel, display(metadata.lensModel));
 }
 
 // ==============================================================================
@@ -1702,6 +3473,219 @@ void MainWindow::selectCurveChannel(int channelIndex)
     }
 }
 
+QString MainWindow::historyLabelForSender(const QObject* senderObj) const
+{
+    if (!senderObj) return QString();
+
+    if (senderObj == m_exposureSlider)   return tr("Exposure changed");
+    if (senderObj == m_contrastSlider)   return tr("Contrast changed");
+    if (senderObj == m_highlightsSlider) return tr("Highlights changed");
+    if (senderObj == m_shadowsSlider)    return tr("Shadows changed");
+    if (senderObj == m_whitesSlider)     return tr("Whites changed");
+    if (senderObj == m_blacksSlider)     return tr("Blacks changed");
+    if (senderObj == m_brightnessSlider) return tr("Brightness changed");
+
+    if (senderObj == m_temperatureSlider) return tr("Temperature changed");
+    if (senderObj == m_tintSlider)        return tr("Tint changed");
+    if (senderObj == m_vibranceSlider)    return tr("Vibrance changed");
+    if (senderObj == m_saturationSlider)  return tr("Saturation changed");
+    if (senderObj == m_hslHueSlider ||
+        senderObj == m_hslSaturationSlider ||
+        senderObj == m_hslLuminanceSlider) {
+        return tr("HSL changed");
+    }
+
+    if (senderObj == m_curveEditor) return tr("Curve changed");
+
+    if (senderObj == m_lutOpacitySlider) return tr("LUT opacity changed");
+    if (senderObj == m_lutEnabledCheck)  return tr("LUT enabled changed");
+
+    if (senderObj == m_hdrEnabledCheck ||
+        senderObj == m_hdrExposureBiasSlider ||
+        senderObj == m_hdrHighlightCompressionSlider ||
+        senderObj == m_hdrShoulderStrengthSlider ||
+        senderObj == m_hdrMidtonePivotSlider ||
+        senderObj == m_hdrSaturationPreserveSlider) {
+        return tr("HDR tone mapping changed");
+    }
+
+    if (senderObj == m_lensEnabledCheck ||
+        senderObj == m_lensRemoveCaCheck ||
+        senderObj == m_lensDistortionSlider ||
+        senderObj == m_lensVignettingSlider ||
+        senderObj == m_lensPurpleFringeSlider ||
+        senderObj == m_lensGreenFringeSlider) {
+        return tr("Lens correction changed");
+    }
+
+    if (senderObj == m_straightenSlider ||
+        senderObj == m_transformFlipHorizontalBtn ||
+        senderObj == m_transformFlipVerticalBtn) {
+        return tr("Transform changed");
+    }
+
+    if (senderObj == m_sharpeningAmountSlider ||
+        senderObj == m_sharpeningRadiusSlider ||
+        senderObj == m_sharpeningDetailSlider ||
+        senderObj == m_sharpeningMaskingSlider) {
+        return tr("Sharpening changed");
+    }
+    if (senderObj == m_luminanceNrSlider ||
+        senderObj == m_luminanceDetailSlider ||
+        senderObj == m_colorNrSlider ||
+        senderObj == m_colorDetailSlider) {
+        return tr("Noise reduction changed");
+    }
+
+    if (senderObj == m_maskList ||
+        senderObj == m_maskExposureSlider ||
+        senderObj == m_maskBrightnessSlider ||
+        senderObj == m_maskContrastSlider ||
+        senderObj == m_maskSaturationSlider ||
+        senderObj == m_maskTemperatureSlider ||
+        senderObj == m_maskTintSlider ||
+        senderObj == m_maskFeatherSlider ||
+        senderObj == m_maskDensitySlider ||
+        senderObj == m_maskFlowSlider ||
+        senderObj == m_maskBrushSizeSlider ||
+        senderObj == m_maskOverlayOpacitySlider) {
+        return tr("Mask changed");
+    }
+
+    if (senderObj == m_layerList ||
+        senderObj == m_layerOpacitySlider ||
+        senderObj == m_layerBlendModeCombo) {
+        return tr("Layer changed");
+    }
+
+    for (const auto& wheel : m_gradingWheels) {
+        if (senderObj == wheel.wheel ||
+            senderObj == wheel.str ||
+            senderObj == wheel.lum ||
+            senderObj == wheel.resetBtn) {
+            return tr("Color grading changed");
+        }
+    }
+    if (senderObj == m_balanceSlider ||
+        senderObj == m_blendingSlider ||
+        senderObj == m_liftSlider ||
+        senderObj == m_gammaSlider ||
+        senderObj == m_gainSlider ||
+        senderObj == m_offsetSlider ||
+        senderObj == m_filmicContrastSlider ||
+        senderObj == m_highlightRolloffSlider ||
+        senderObj == m_shadowLiftSlider ||
+        senderObj == m_fadeBlacksSlider ||
+        senderObj == m_colorSeparationSlider) {
+        return tr("Color grading changed");
+    }
+
+    if (const auto* button = qobject_cast<const QPushButton*>(senderObj)) {
+        const QString text = button->text();
+        if (text.contains(tr("Linear"), Qt::CaseInsensitive) ||
+            text.contains(tr("Radial"), Qt::CaseInsensitive) ||
+            text.contains(tr("Brush"), Qt::CaseInsensitive)) {
+            return tr("Mask added");
+        }
+        if (text.contains(tr("Rotate"), Qt::CaseInsensitive) ||
+            text.contains(tr("Flip"), Qt::CaseInsensitive) ||
+            text.contains(tr("Transform"), Qt::CaseInsensitive) ||
+            text.contains(tr("Crop"), Qt::CaseInsensitive)) {
+            return tr("Transform changed");
+        }
+    }
+
+    if (const auto* action = qobject_cast<const QAction*>(senderObj)) {
+        QString text = action->text();
+        text.remove(QLatin1Char('&'));
+        if (text.contains(tr("Reset Edits"), Qt::CaseInsensitive))
+            return tr("Reset edits");
+        if (text.contains(tr("Rotate"), Qt::CaseInsensitive) ||
+            text.contains(tr("Flip"), Qt::CaseInsensitive))
+            return tr("Transform changed");
+    }
+
+    return QString();
+}
+
+void MainWindow::recordHistoryStep(QString label)
+{
+    label = label.trimmed();
+    if (label.isEmpty()) label = tr("Edit");
+
+    if (m_historyCurrentIndex >= 0 &&
+        m_historyCurrentIndex + 1 < static_cast<int>(m_historyEntries.size())) {
+        m_historyEntries.erase(m_historyEntries.begin() + m_historyCurrentIndex + 1,
+                               m_historyEntries.end());
+    }
+
+    m_historyEntries.push_back(HistoryEntry{ label, m_look });
+    while (m_historyEntries.size() > kMaxUndoDepth + 1) {
+        m_historyEntries.erase(m_historyEntries.begin());
+    }
+
+    m_historyCurrentIndex = static_cast<int>(m_historyEntries.size()) - 1;
+    refreshHistoryList();
+    saveActiveDocumentState();
+}
+
+void MainWindow::clearHistory(const QString& baselineLabel)
+{
+    m_historyEntries.clear();
+    m_historyCurrentIndex = -1;
+    m_nextHistoryLabel.clear();
+
+    const QString label = baselineLabel.trimmed();
+    if (!label.isEmpty()) {
+        m_historyEntries.push_back(HistoryEntry{ label, m_look });
+        m_historyCurrentIndex = 0;
+    }
+
+    refreshHistoryList();
+    saveActiveDocumentState();
+}
+
+void MainWindow::refreshHistoryList()
+{
+    if (!m_historyList) return;
+
+    m_syncingHistorySelection = true;
+    QSignalBlocker block(m_historyList);
+    m_historyList->clear();
+
+    if (m_historyEntries.empty()) {
+        auto* item = new QListWidgetItem(tr("No history yet"), m_historyList);
+        item->setFlags(Qt::NoItemFlags);
+        item->setForeground(QColor(0x7A, 0x7A, 0x7A));
+        m_historyCurrentIndex = -1;
+        m_syncingHistorySelection = false;
+        return;
+    }
+
+    for (int i = 0; i < static_cast<int>(m_historyEntries.size()); ++i) {
+        const HistoryEntry& entry = m_historyEntries[static_cast<size_t>(i)];
+        auto* item = new QListWidgetItem(entry.label, m_historyList);
+        item->setToolTip(tr("History state stored. Click-to-restore is a future step."));
+        item->setFlags(Qt::ItemIsEnabled | Qt::ItemIsSelectable);
+    }
+
+    if (m_historyCurrentIndex >= 0 &&
+        m_historyCurrentIndex < static_cast<int>(m_historyEntries.size())) {
+        m_historyList->setCurrentRow(m_historyCurrentIndex);
+    }
+    m_syncingHistorySelection = false;
+}
+
+void MainWindow::updateCurrentHistorySnapshot()
+{
+    if (m_historyCurrentIndex < 0 ||
+        m_historyCurrentIndex >= static_cast<int>(m_historyEntries.size())) {
+        return;
+    }
+    m_historyEntries[static_cast<size_t>(m_historyCurrentIndex)].snapshot = m_look;
+    saveActiveDocumentState();
+}
+
 // ==============================================================================
 // Undo / Redo
 //
@@ -1729,9 +3713,18 @@ void MainWindow::pushUndoSnapshot()
     // Re-entry guard. applyLookToUi sets this true; any pushUndoSnapshot
     // call that somehow fires during programmatic widget updates gets
     // swallowed here.
-    if (m_isApplyingLookToUi) return;
+    if (m_isApplyingLookToUi) {
+        m_nextHistoryLabel.clear();
+        return;
+    }
+
+    QString historyLabel = m_nextHistoryLabel.trimmed();
+    m_nextHistoryLabel.clear();
+    if (historyLabel.isEmpty())
+        historyLabel = historyLabelForSender(sender());
 
     m_undoStack.push_back(m_look);
+    recordHistoryStep(historyLabel);
 
     // A new edit invalidates any future-branch that was being held in redo.
     // This is the standard linear-history model: branching would require
@@ -1746,6 +3739,7 @@ void MainWindow::pushUndoSnapshot()
     }
 
     refreshUndoRedoActions();
+    saveActiveDocumentState();
 }
 
 void MainWindow::undo()
@@ -1757,8 +3751,12 @@ void MainWindow::undo()
     m_look = m_undoStack.back();
     m_undoStack.pop_back();
 
+    if (m_historyCurrentIndex > 0)
+        --m_historyCurrentIndex;
     applyLookToUi();
     refreshUndoRedoActions();
+    refreshHistoryList();
+    saveActiveDocumentState();
 }
 
 void MainWindow::redo()
@@ -1769,6 +3767,8 @@ void MainWindow::redo()
     m_undoStack.push_back(m_look);
     m_look = m_redoStack.back();
     m_redoStack.pop_back();
+    if (m_historyCurrentIndex + 1 < static_cast<int>(m_historyEntries.size()))
+        ++m_historyCurrentIndex;
 
     // Note: we do NOT cap the undo stack here. The user can't possibly have
     // redone more than they undid (that'd require the redo stack to have
@@ -1777,6 +3777,8 @@ void MainWindow::redo()
 
     applyLookToUi();
     refreshUndoRedoActions();
+    refreshHistoryList();
+    saveActiveDocumentState();
 }
 
 void MainWindow::applyLookToUi()
@@ -1866,6 +3868,20 @@ void MainWindow::applyLookToUi()
     // a second time.
     refreshGradingWidgets();
 
+    // ---- HDR tone mapping ------------------------------------------------
+    refreshHdrWidgets();
+
+    // ---- Lens correction --------------------------------------------------
+    // Master-enable + four sliders + CA checkbox. Same lifecycle as the
+    // other refresh functions — signal-blocked, no debounce kick.
+    refreshLensWidgets();
+
+    // ---- Transform --------------------------------------------------------
+    refreshTransformWidgets();
+
+    // ---- Details ----------------------------------------------------------
+    refreshDetailsWidgets();
+
     // ---- Local masks ------------------------------------------------------
     // Rebuild the mask list and re-sync the per-mask sliders. Handles undo/
     // redo replacing m_look entirely, project/preset load with new masks,
@@ -1893,9 +3909,52 @@ void MainWindow::applyLookToUi()
 // ==============================================================================
 // File I/O
 // ==============================================================================
-// Project file format version. Bump when the .lumen JSON envelope structure
-// changes (the embedded "look" object follows LookSerializer's own versioning).
-constexpr int kProjectSchemaVersion = 1;
+namespace {
+
+bool isSupportedImagePath(const QString& path)
+{
+    const QString suffix = QFileInfo(path).suffix().toLower();
+    static const QStringList standard = {
+        QStringLiteral("png"),
+        QStringLiteral("jpg"),
+        QStringLiteral("jpeg"),
+        QStringLiteral("bmp"),
+        QStringLiteral("tif"),
+        QStringLiteral("tiff"),
+        QStringLiteral("webp")
+    };
+    return standard.contains(suffix) || lps::RawImageLoader::isRawExtension(path);
+}
+
+QString firstSupportedDroppedImage(const QMimeData* mime)
+{
+    if (!mime || !mime->hasUrls())
+        return QString();
+    for (const QUrl& url : mime->urls()) {
+        if (!url.isLocalFile())
+            continue;
+        const QString path = url.toLocalFile();
+        if (QFileInfo(path).isFile() && isSupportedImagePath(path))
+            return path;
+    }
+    return QString();
+}
+
+QImage loadImageForEditor(const QString& path, QString* error)
+{
+    if (error) error->clear();
+
+    if (lps::RawImageLoader::isRawExtension(path)) {
+        return lps::RawImageLoader::load(path, error);
+    }
+
+    QImage img;
+    if (!img.load(path) && error)
+        *error = QObject::tr("Could not load: %1").arg(path);
+    return img;
+}
+
+} // namespace
 
 void MainWindow::onOpenImage()
 {
@@ -1905,18 +3964,17 @@ void MainWindow::onOpenImage()
     // hidden carry-over surprising, so we now reset.) If you want to
     // share edits across images, use Save Project / Open Project instead.
     //
-    // Because the reset DOES discard work, we prompt for unsaved changes
-    // before showing the file dialog. Drag-and-drop runs the same prompt
-    // in MainWindow's drop handler before calling loadImageFromPath.
-    if (!maybePromptUnsavedChanges()) return;
-
-    const QString picturesDir =
-        QStandardPaths::writableLocation(QStandardPaths::PicturesLocation);
+    const QString picturesDir = m_settings
+        ? m_settings->lastOpenFolder()
+        : QStandardPaths::writableLocation(QStandardPaths::PicturesLocation);
     const QString path = QFileDialog::getOpenFileName(
         this,
         tr("Open Image"),
         picturesDir,
-        tr("Images (*.png *.jpg *.jpeg *.bmp *.tiff *.webp)"));
+        tr("Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp "
+           "*.cr2 *.cr3 *.nef *.arw *.dng *.raf *.orf *.rw2);;"
+           "RAW Images (*.cr2 *.cr3 *.nef *.arw *.dng *.raf *.orf *.rw2);;"
+           "Standard Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp)"));
     if (path.isEmpty()) return;
 
     loadImageFromPath(path);
@@ -1924,17 +3982,30 @@ void MainWindow::onOpenImage()
 
 bool MainWindow::loadImageFromPath(const QString& path)
 {
-    QImage img;
-    if (!img.load(path)) {
+    QString loadError;
+    QImage img = loadImageForEditor(path, &loadError);
+    if (img.isNull()) {
         QMessageBox::warning(this, tr("Open Image"),
-                             tr("Could not load: %1").arg(path));
+                             loadError.isEmpty()
+                                 ? tr("Could not load: %1").arg(path)
+                                 : loadError);
         return false;
     }
+
+    saveActiveDocumentState();
+    m_isLoadingProject = true;
 
     // ---- Commit the new image + reset all editor state -------------------
     m_originalFullRes = img;
     m_currentImagePath = path;
     m_currentProjectPath.clear();   // new image = no project yet
+    m_projectCreatedDate = QDateTime();
+    m_projectModifiedDate = QDateTime();
+    if (m_settings) {
+        m_settings->setLastOpenFolder(QFileInfo(path).absolutePath());
+        m_settings->addRecentImage(path);
+        refreshWelcomeRecentFiles();
+    }
 
     const int longest = std::max(img.width(), img.height());
     if (longest <= kPreviewMaxEdge) {
@@ -1944,18 +4015,28 @@ bool MainWindow::loadImageFromPath(const QString& path)
                                      Qt::KeepAspectRatio,
                                      Qt::SmoothTransformation);
     }
+    m_processed = QImage();
+    if (m_histogramWidget) m_histogramWidget->setImage(m_previewSource);
+    updateMetadataPanel();
+    updateNavigatorPreview();
 
     // Reset the edit state. lps::Look is a default-constructible aggregate
     // whose member defaults all correspond to identity — sliders at 0,
     // curves at the {(0,0),(1,1)} two-point identity, etc. Plain assignment
     // is the canonical reset.
     m_look = lps::Look{};
+    if (m_previewLabel) m_previewLabel->setCropOverlayActive(false);
+    if (m_cropToolBtn) {
+        QSignalBlocker block(m_cropToolBtn);
+        m_cropToolBtn->setChecked(false);
+    }
 
     // Clear undo history. The new image is its own clean baseline; letting
     // the user undo into the previous image's edit chain would be very
     // confusing (and the snapshots would be applied to a different source).
     m_undoStack.clear();
     m_redoStack.clear();
+    clearHistory(tr("Open Image"));
     refreshUndoRedoActions();
 
     // Push the freshly-default Look into every UI widget. m_isLoadingProject
@@ -1963,7 +4044,6 @@ bool MainWindow::loadImageFromPath(const QString& path)
     // suppression flag — it gates the dirty-mark inside the debounce
     // handler, so the render that applyLookToUi triggers doesn't make the
     // new untitled project look dirty before the user has touched anything.
-    m_isLoadingProject = true;
     applyLookToUi();
     // applyLookToUi kicked the debounce; cancel it because we're about to
     // render directly. Without this, we'd render twice for the same Look.
@@ -1973,12 +4053,14 @@ bool MainWindow::loadImageFromPath(const QString& path)
     // Clean baseline: not dirty, refresh the title to "Untitled" with no
     // asterisk.
     m_projectDirty = false;
+    appendCurrentStateAsDocument();
     updateWindowTitle();
 
     // Hide the empty-state overlay so the preview widget's image content
     // shows through. Symmetric with showing it again on the no-image
     // branches (see loadProjectFromPath).
     if (m_emptyState) m_emptyState->hide();
+    showEditorWorkspace();
 
     // Reset the preview to Fit mode for the newly-loaded image. Without
     // this, leftover zoom/pan state from a previous image would carry over
@@ -1992,15 +4074,14 @@ bool MainWindow::loadImageFromPath(const QString& path)
 
 void MainWindow::onOpenProject()
 {
-    if (!maybePromptUnsavedChanges()) return;
-
-    const QString picturesDir =
-        QStandardPaths::writableLocation(QStandardPaths::PicturesLocation);
+    const QString picturesDir = m_settings
+        ? m_settings->lastOpenFolder()
+        : QStandardPaths::writableLocation(QStandardPaths::PicturesLocation);
     const QString path = QFileDialog::getOpenFileName(
         this,
         tr("Open Project"),
         picturesDir,
-        tr("Lumen Projects (*.lumen);;All Files (*)"));
+        tr("Lumen Projects (*.lps);;All Files (*)"));
     if (path.isEmpty()) return;
 
     if (!loadProjectFromPath(path)) {
@@ -2017,32 +4098,41 @@ void MainWindow::onSaveProject()
         onSaveProjectAs();
         return;
     }
+    if (!m_currentProjectPath.endsWith(QStringLiteral(".lps"), Qt::CaseInsensitive)) {
+        onSaveProjectAs();
+        return;
+    }
     saveProjectToPath(m_currentProjectPath);
 }
 
 void MainWindow::onSaveProjectAs()
 {
-    const QString picturesDir =
-        QStandardPaths::writableLocation(QStandardPaths::PicturesLocation);
-    QString defaultName = QStringLiteral("Untitled.lumen");
+    const QString picturesDir = m_settings
+        ? m_settings->lastOpenFolder()
+        : QStandardPaths::writableLocation(QStandardPaths::PicturesLocation);
+    QString defaultName = QStringLiteral("Untitled.lps");
     if (!m_currentImagePath.isEmpty()) {
-        // Suggest the source image's basename + .lumen.
+        // Suggest the source image's basename + .lps.
         const QFileInfo fi(m_currentImagePath);
-        defaultName = fi.completeBaseName() + QStringLiteral(".lumen");
+        defaultName = fi.completeBaseName() + QStringLiteral(".lps");
     }
 
     const QString path = QFileDialog::getSaveFileName(
         this,
         tr("Save Project As"),
         picturesDir + QLatin1Char('/') + defaultName,
-        tr("Lumen Projects (*.lumen)"));
+        tr("Lumen Projects (*.lps)"));
     if (path.isEmpty()) return;
 
-    // Force the .lumen extension if the user didn't supply one. Some platforms'
+    // Force the .lps extension if the user didn't supply one. Some platforms'
     // dialogs don't auto-append based on the filter.
     QString finalPath = path;
-    if (!finalPath.endsWith(QStringLiteral(".lumen"), Qt::CaseInsensitive)) {
-        finalPath += QStringLiteral(".lumen");
+    if (!finalPath.endsWith(QStringLiteral(".lps"), Qt::CaseInsensitive)) {
+        const QFileInfo typed(finalPath);
+        finalPath = typed.suffix().isEmpty()
+            ? finalPath + QStringLiteral(".lps")
+            : typed.path() + QLatin1Char('/') + typed.completeBaseName()
+                + QStringLiteral(".lps");
     }
 
     saveProjectToPath(finalPath);
@@ -2056,8 +4146,9 @@ void MainWindow::onExportImage()
         return;
     }
 
-    const QString picturesDir =
-        QStandardPaths::writableLocation(QStandardPaths::PicturesLocation);
+    const QString picturesDir = m_settings
+        ? m_settings->defaultExportFolder()
+        : QStandardPaths::writableLocation(QStandardPaths::PicturesLocation);
 
     // Suggest source basename as the default export name.
     QString defaultName = QStringLiteral("export.png");
@@ -2066,23 +4157,11 @@ void MainWindow::onExportImage()
         defaultName = fi.completeBaseName() + QStringLiteral("_export.png");
     }
 
-    // Filter list. WebP support depends on the Qt build's image plugins;
-    // Qt's QImage::save returns false at runtime if the format isn't
-    // available, so we offer the option and surface a clean error if it
-    // fails. Same applies to TIFF (usually present, occasionally trimmed
-    // out of minimal Qt builds).
-    const QString filters = tr(
-        "PNG (*.png);;"
-        "JPEG (*.jpg *.jpeg);;"
-        "TIFF (*.tif *.tiff);;"
-        "WebP (*.webp)");
-
-    const QString path = QFileDialog::getSaveFileName(
-        this,
-        tr("Export Image"),
-        picturesDir + QLatin1Char('/') + defaultName,
-        filters);
-    if (path.isEmpty()) return;
+    ExportDialog dialog(picturesDir, defaultName, m_originalFullRes.size(), this);
+    if (dialog.exec() != QDialog::Accepted)
+        return;
+    const ExportDialog::Options exportOptions = dialog.options();
+    const QString path = exportOptions.outputPath();
 
     // Full-resolution render through the same pipeline. Blocks the UI thread —
     // acceptable for a desktop tool at typical photo sizes; a future step
@@ -2090,143 +4169,197 @@ void MainWindow::onExportImage()
     // huge files.
     lps::ImagePipeline pipeline;
     const lps::RenderResult r = pipeline.render(m_originalFullRes, m_look);
-    if (r.image.isNull()) {
+    QImage exportImage = r.image;
+    if (exportImage.isNull()) {
         QMessageBox::warning(this, tr("Export Image"), tr("Render failed."));
         return;
     }
 
-    if (!r.image.save(path)) {
+    if (exportOptions.resize) {
+        exportImage = exportImage.scaled(
+            exportOptions.width,
+            exportOptions.height,
+            exportOptions.preserveAspectRatio
+                ? Qt::KeepAspectRatio
+                : Qt::IgnoreAspectRatio,
+            Qt::SmoothTransformation);
+    }
+
+    if (exportOptions.format == QStringLiteral("JPG") &&
+        exportImage.hasAlphaChannel()) {
+        exportImage = exportImage.convertToFormat(QImage::Format_RGB888);
+    }
+
+    QImageWriter writer(path, exportOptions.imageFormat());
+    if (exportOptions.format == QStringLiteral("JPG") ||
+        exportOptions.format == QStringLiteral("WEBP")) {
+        writer.setQuality(exportOptions.quality);
+    }
+
+    if (!writer.write(exportImage)) {
         QMessageBox::warning(
             this, tr("Export Image"),
             tr("Could not write: %1\n\n"
+               "%2\n\n"
                "If you exported as WebP or TIFF, your Qt build may not "
                "include support for that format. Try PNG or JPEG.")
-                .arg(path));
+                .arg(path, writer.errorString()));
+    } else if (m_settings) {
+        m_settings->setDefaultExportFolder(QFileInfo(path).absolutePath());
     }
 }
 
 // ==============================================================================
-// Project I/O — .lumen file format
+// Project I/O — .lps file format
 //
 // JSON envelope:
 //   {
 //     "schemaVersion":      1,
 //     "projectName":        "...",
-//     "originalImagePath":  "...",
+//     "sourceImagePath":    "...",
 //     "look":               { ... LookSerializer JSON ... }
 //   }
 //
 // The "look" object is exactly what LookSerializer::toJson produces, embedded
-// inline (not stringified) so the .lumen file is human-readable. This means
+// inline (not stringified) so the .lps file is human-readable. This means
 // future Look schema changes propagate automatically.
 //
-// originalImagePath is stored as an absolute path. Future work: consider
-// storing it relative to the .lumen file's directory so projects can be
+// sourceImagePath is stored as an absolute path. Future work: consider
+// storing it relative to the .lps file's directory so projects can be
 // moved/shared. Out of scope for this step.
 // ==============================================================================
 bool MainWindow::saveProjectToPath(const QString& path)
 {
-    QJsonObject root;
-    root.insert(QStringLiteral("schemaVersion"), kProjectSchemaVersion);
-    root.insert(QStringLiteral("projectName"),
-                QFileInfo(path).completeBaseName());
-    root.insert(QStringLiteral("originalImagePath"), m_currentImagePath);
-    root.insert(QStringLiteral("look"), lps::LookSerializer::toJson(m_look));
+    lps::ProjectDocument project;
+    project.projectName = QFileInfo(path).completeBaseName();
+    project.projectPathReference = path;
+    project.sourceImagePath = m_currentImagePath;
+    project.look = m_look;
+    project.exportSettingsReference = QStringLiteral("default");
+    project.createdDate = m_projectCreatedDate.isValid()
+        ? m_projectCreatedDate
+        : QDateTime::currentDateTimeUtc();
+    project.modifiedDate = QDateTime::currentDateTimeUtc();
 
-    QJsonDocument doc(root);
-    const QByteArray bytes = doc.toJson(QJsonDocument::Indented);
-
-    QFile f(path);
-    if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        QMessageBox::warning(this, tr("Save Project"),
-                             tr("Could not open for writing: %1").arg(path));
+    const lps::ProjectSaveResult result =
+        lps::ProjectSerializer::saveToFile(project, path);
+    if (!result.ok) {
+        QMessageBox::warning(this, tr("Save Project"), result.errorMessage);
         return false;
     }
-    if (f.write(bytes) != bytes.size()) {
-        QMessageBox::warning(this, tr("Save Project"),
-                             tr("Write failed: %1").arg(path));
-        return false;
-    }
-    f.close();
 
     m_currentProjectPath = path;
+    m_projectCreatedDate = project.createdDate;
+    m_projectModifiedDate = project.modifiedDate;
     m_projectDirty = false;
+    if (m_debounce && m_debounce->isActive()) {
+        m_debounce->stop();
+        requestRender();
+    }
+    saveActiveDocumentState();
+    updateDocumentTabs();
+    if (m_autosaveManager)
+        m_autosaveManager->deleteAllAutosaves();
+    if (m_settings) {
+        m_settings->setLastOpenFolder(QFileInfo(path).absolutePath());
+        m_settings->addRecentProject(path);
+        refreshWelcomeRecentFiles();
+    }
     updateWindowTitle();
     return true;
 }
 
 bool MainWindow::loadProjectFromPath(const QString& path)
 {
-    QFile f(path);
-    if (!f.open(QIODevice::ReadOnly)) {
-        QMessageBox::warning(this, tr("Open Project"),
-                             tr("Could not open: %1").arg(path));
-        return false;
-    }
-    const QByteArray bytes = f.readAll();
-    f.close();
-
-    QJsonParseError parseErr;
-    const QJsonDocument doc = QJsonDocument::fromJson(bytes, &parseErr);
-    if (doc.isNull() || !doc.isObject()) {
-        QMessageBox::warning(this, tr("Open Project"),
-                             tr("Invalid project file: %1\n\n%2")
-                                 .arg(path, parseErr.errorString()));
+    const lps::ProjectLoadResult result =
+        lps::ProjectSerializer::loadFromFile(path);
+    if (!result.ok) {
+        QMessageBox::warning(this, tr("Open Project"), result.errorMessage);
         return false;
     }
 
-    const QJsonObject root = doc.object();
-    const int fileSchema = root.value(QStringLiteral("schemaVersion")).toInt(1);
-    if (fileSchema > kProjectSchemaVersion) {
+    const lps::ProjectDocument project = result.document;
+    if (project.schemaVersion > lps::ProjectSerializer::kCurrentSchemaVersion) {
         QMessageBox::warning(
             this, tr("Open Project"),
             tr("This project was saved with a newer version of Lumen "
                "(schema %1). Some settings may not load correctly.")
-                .arg(fileSchema));
+                .arg(project.schemaVersion));
         // Continue loading anyway — the embedded LookSerializer JSON is
         // tolerant of missing fields, so we'll get a best-effort import.
     }
 
-    const QString imagePath = root.value(QStringLiteral("originalImagePath")).toString();
-    const QJsonValue lookVal = root.value(QStringLiteral("look"));
-
-    if (!lookVal.isObject()) {
-        QMessageBox::warning(this, tr("Open Project"),
-                             tr("Project file is missing Look data: %1").arg(path));
-        return false;
-    }
-
-    lps::Look loadedLook;
-    QString lookErr;
-    if (!lps::LookSerializer::fromJson(lookVal.toObject(), loadedLook, &lookErr)) {
-        QMessageBox::warning(this, tr("Open Project"),
-                             tr("Could not parse Look:\n%1").arg(lookErr));
-        return false;
-    }
-
+    QString imagePath = project.sourceImagePath;
     // Try to load the referenced source image. If it's missing/unreadable,
     // surface a non-fatal warning and continue — the user can still see
     // the Look settings, and "relink" workflows are common in real editors.
     QImage img;
+    QString imageLoadError;
     bool imageLoaded = false;
-    if (!imagePath.isEmpty() && img.load(imagePath)) {
-        imageLoaded = true;
-    } else if (!imagePath.isEmpty()) {
-        QMessageBox::information(
-            this, tr("Open Project"),
-            tr("Original image not found:\n%1\n\n"
-               "Project loaded but no preview will be shown until you "
-               "open a replacement image.").arg(imagePath));
+    bool sourceRelinked = false;
+    if (!imagePath.isEmpty()) {
+        img = loadImageForEditor(imagePath, &imageLoadError);
+        imageLoaded = !img.isNull();
+    }
+    if (!imageLoaded && !imagePath.isEmpty()) {
+        QMessageBox relinkBox(this);
+        relinkBox.setWindowTitle(tr("Missing Source Image"));
+        relinkBox.setText(tr("Could not load the source image:\n%1").arg(imagePath));
+        relinkBox.setInformativeText(imageLoadError.isEmpty()
+            ? tr("Relink the image to restore the preview, or continue without it.")
+            : imageLoadError);
+        auto* relinkButton =
+            relinkBox.addButton(tr("Relink Image"), QMessageBox::AcceptRole);
+        auto* continueButton =
+            relinkBox.addButton(tr("Continue Without Image"), QMessageBox::DestructiveRole);
+        relinkBox.addButton(QMessageBox::Cancel);
+        relinkBox.exec();
+
+        if (relinkBox.clickedButton() == relinkButton) {
+            const QString relinkPath = QFileDialog::getOpenFileName(
+                this,
+                tr("Relink Source Image"),
+                QFileInfo(imagePath).absolutePath(),
+                tr("Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp "
+                   "*.cr2 *.cr3 *.nef *.arw *.dng *.raf *.orf *.rw2);;"
+                   "RAW Images (*.cr2 *.cr3 *.nef *.arw *.dng *.raf *.orf *.rw2);;"
+                   "Standard Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp)"));
+            if (relinkPath.isEmpty())
+                return false;
+            imagePath = relinkPath;
+            sourceRelinked = true;
+            imageLoadError.clear();
+            img = loadImageForEditor(imagePath, &imageLoadError);
+            imageLoaded = !img.isNull();
+            if (!imageLoaded) {
+                QMessageBox::warning(this, tr("Open Project"),
+                                     imageLoadError.isEmpty()
+                                         ? tr("Could not load: %1").arg(imagePath)
+                                         : imageLoadError);
+                return false;
+            }
+        } else if (relinkBox.clickedButton() != continueButton) {
+            return false;
+        }
     }
 
     // ---- Commit the load -------------------------------------------------
+    saveActiveDocumentState();
+
     // Suppress dirty-marking while we update m_look + UI. The debounce kick
     // inside applyLookToUi would otherwise call markDirty().
     m_isLoadingProject = true;
 
-    m_look = loadedLook;
+    m_look = project.look;
     m_currentImagePath = imagePath;
     m_currentProjectPath = path;
+    m_projectCreatedDate = project.createdDate;
+    m_projectModifiedDate = project.modifiedDate;
+    if (m_previewLabel) m_previewLabel->setCropOverlayActive(false);
+    if (m_cropToolBtn) {
+        QSignalBlocker block(m_cropToolBtn);
+        m_cropToolBtn->setChecked(false);
+    }
 
     if (imageLoaded) {
         m_originalFullRes = img;
@@ -2235,6 +4368,9 @@ bool MainWindow::loadProjectFromPath(const QString& path)
             ? img
             : img.scaled(kPreviewMaxEdge, kPreviewMaxEdge,
                          Qt::KeepAspectRatio, Qt::SmoothTransformation);
+        m_processed = QImage();
+        if (m_histogramWidget) m_histogramWidget->setImage(m_previewSource);
+        if (m_emptyState) m_emptyState->hide();
     } else {
         // No image — clear preview state so the editor doesn't try to render
         // against stale pixels from a previous session.
@@ -2244,6 +4380,8 @@ bool MainWindow::loadProjectFromPath(const QString& path)
         // Also clear the histogram so it doesn't keep showing the previous
         // image's distribution.
         if (m_histogramWidget) m_histogramWidget->setImage(QImage());
+        updateMetadataPanel();
+        updateNavigatorPreview();
         // Wipe the preview widget so the overlay isn't drawn over a stale
         // image, then bring the empty-state overlay back.
         if (m_previewLabel) {
@@ -2264,12 +4402,20 @@ bool MainWindow::loadProjectFromPath(const QString& path)
     // confusing.
     m_undoStack.clear();
     m_redoStack.clear();
+    clearHistory(tr("Open Project"));
     refreshUndoRedoActions();
 
     // Push the loaded values into all UI widgets, then trigger a render.
     // applyLookToUi() kicks the debounce; that fires onDebounceFired which
     // will short-circuit the markDirty() because m_isLoadingProject is true.
     applyLookToUi();
+    updateMetadataPanel();
+    updateNavigatorPreview();
+
+    m_isLoadingProject = false;
+
+    m_projectDirty = sourceRelinked;
+    appendCurrentStateAsDocument();
 
     if (imageLoaded) {
         requestRender();
@@ -2278,11 +4424,104 @@ bool MainWindow::loadProjectFromPath(const QString& path)
         m_previewLabel->setEditedImage(QImage());
     }
 
-    m_isLoadingProject = false;
-
-    m_projectDirty = false;
+    if (sourceRelinked)
+        scheduleAutosave();
+    if (m_settings) {
+        m_settings->setLastOpenFolder(QFileInfo(path).absolutePath());
+        m_settings->addRecentProject(path);
+        refreshWelcomeRecentFiles();
+    }
     updateWindowTitle();
+    showEditorWorkspace();
     return true;
+}
+
+bool MainWindow::recoverAutosaveFromPath(const QString& path)
+{
+    const lps::ProjectLoadResult result =
+        lps::ProjectSerializer::loadFromFile(path);
+    if (!result.ok) {
+        QMessageBox::warning(this, tr("Autosave Recovery"), result.errorMessage);
+        return false;
+    }
+
+    const QString projectReference = result.document.projectPathReference;
+    if (!loadProjectFromPath(path))
+        return false;
+
+    m_currentProjectPath = projectReference;
+    m_projectDirty = true;
+    if (m_settings) {
+        QStringList projects = m_settings->recentProjects();
+        projects.removeAll(QDir::fromNativeSeparators(QFileInfo(path).absoluteFilePath()));
+        m_settings->setRecentProjects(projects);
+        if (!projectReference.isEmpty() && QFileInfo(projectReference).isFile())
+            m_settings->addRecentProject(projectReference);
+        refreshWelcomeRecentFiles();
+    }
+    updateWindowTitle();
+    saveActiveDocumentState();
+    updateDocumentTabs();
+    return true;
+}
+
+void MainWindow::checkAutosaveRecovery()
+{
+    if (!m_autosaveManager || !m_autosaveManager->hasAutosave())
+        return;
+
+    const QString autosavePath = m_autosaveManager->latestAutosavePath();
+    if (autosavePath.isEmpty())
+        return;
+
+    QMessageBox box(this);
+    box.setWindowTitle(tr("Autosave Recovery"));
+    box.setText(tr("Recover last session?"));
+    box.setInformativeText(QFileInfo(autosavePath).fileName());
+    auto* recoverButton = box.addButton(tr("Recover"), QMessageBox::AcceptRole);
+    auto* discardButton = box.addButton(tr("Discard"), QMessageBox::DestructiveRole);
+    box.setDefaultButton(recoverButton);
+    box.exec();
+
+    if (box.clickedButton() == recoverButton) {
+        if (recoverAutosaveFromPath(autosavePath)) {
+            m_autosaveManager->deleteAllAutosaves();
+            scheduleAutosave();
+        }
+        return;
+    }
+
+    if (box.clickedButton() == discardButton)
+        m_autosaveManager->deleteAllAutosaves();
+}
+
+lps::ProjectDocument MainWindow::currentProjectDocumentForAutosave() const
+{
+    lps::ProjectDocument project;
+    project.projectName = m_currentProjectPath.isEmpty()
+        ? tr("Recovered Session")
+        : QFileInfo(m_currentProjectPath).completeBaseName();
+    project.projectPathReference = m_currentProjectPath;
+    project.sourceImagePath = m_currentImagePath;
+    project.look = m_look;
+    project.exportSettingsReference = QStringLiteral("default");
+    project.createdDate = m_projectCreatedDate.isValid()
+        ? m_projectCreatedDate
+        : QDateTime::currentDateTimeUtc();
+    project.modifiedDate = QDateTime::currentDateTimeUtc();
+    return project;
+}
+
+void MainWindow::scheduleAutosave()
+{
+    if (!m_autosaveManager || m_isLoadingProject)
+        return;
+    if (m_currentImagePath.isEmpty()
+        && m_currentProjectPath.isEmpty()
+        && m_previewSource.isNull()) {
+        return;
+    }
+    m_autosaveManager->schedule(currentProjectDocumentForAutosave());
 }
 
 // ==============================================================================
@@ -2290,18 +4529,24 @@ bool MainWindow::loadProjectFromPath(const QString& path)
 // ==============================================================================
 void MainWindow::markDirty()
 {
-    if (m_projectDirty) return;   // already dirty, nothing to do
+    const bool wasDirty = m_projectDirty;
     m_projectDirty = true;
-    updateWindowTitle();
+    scheduleAutosave();
+    saveActiveDocumentState();
+    updateDocumentTabs();
+    if (!wasDirty)
+        updateWindowTitle();
 }
 
 void MainWindow::updateWindowTitle()
 {
     QString projectLabel;
-    if (m_currentProjectPath.isEmpty()) {
-        projectLabel = tr("Untitled");
-    } else {
+    if (!m_currentProjectPath.isEmpty()) {
         projectLabel = QFileInfo(m_currentProjectPath).fileName();
+    } else if (!m_currentImagePath.isEmpty()) {
+        projectLabel = QFileInfo(m_currentImagePath).fileName();
+    } else {
+        projectLabel = tr("Untitled");
     }
     const QString dirtyMark = m_projectDirty ? QStringLiteral(" *") : QString();
     setWindowTitle(tr("Lumen Photo Studio — %1%2").arg(projectLabel, dirtyMark));
@@ -2309,15 +4554,29 @@ void MainWindow::updateWindowTitle()
 
 bool MainWindow::maybePromptUnsavedChanges()
 {
-    if (!m_projectDirty) return true;
+    return maybePromptSaveDocument(m_activeDocumentIndex);
+}
+
+bool MainWindow::maybePromptSaveDocument(int index)
+{
+    if (index < 0 || index >= static_cast<int>(m_documents.size()))
+        return true;
+    if (index == m_activeDocumentIndex)
+        saveActiveDocumentState();
+
+    ImageDocument& document = m_documents[static_cast<size_t>(index)];
+    if (!document.dirty) return true;
+    const QString title = documentTitle(document);
 
     const auto reply = QMessageBox::question(
         this, tr("Unsaved Changes"),
-        tr("This project has unsaved changes. Save before continuing?"),
+        tr("\"%1\" has unsaved changes. Save before closing?").arg(title),
         QMessageBox::Save | QMessageBox::Discard | QMessageBox::Cancel,
         QMessageBox::Save);
 
     if (reply == QMessageBox::Save) {
+        if (index != m_activeDocumentIndex)
+            setActiveDocumentIndex(index);
         if (m_currentProjectPath.isEmpty()) {
             // No path yet — Save As. If the user cancels the file dialog,
             // saveProjectToPath never runs, and m_projectDirty stays true.
@@ -2327,17 +4586,60 @@ bool MainWindow::maybePromptUnsavedChanges()
         }
         return saveProjectToPath(m_currentProjectPath);
     }
-    if (reply == QMessageBox::Discard) return true;
+    if (reply == QMessageBox::Discard) {
+        document.dirty = false;
+        if (index == m_activeDocumentIndex) {
+            if (m_debounce) m_debounce->stop();
+            m_projectDirty = false;
+            saveActiveDocumentState();
+            updateWindowTitle();
+        }
+        updateDocumentTabs();
+        return true;
+    }
     return false;   // Cancel
+}
+
+bool MainWindow::maybePromptAllUnsavedDocuments()
+{
+    saveActiveDocumentState();
+    for (int i = 0; i < static_cast<int>(m_documents.size()); ++i) {
+        if (!m_documents[static_cast<size_t>(i)].dirty)
+            continue;
+        if (!maybePromptSaveDocument(i))
+            return false;
+    }
+    return true;
 }
 
 void MainWindow::closeEvent(QCloseEvent* event)
 {
-    if (maybePromptUnsavedChanges()) {
+    if (maybePromptAllUnsavedDocuments()) {
         event->accept();
     } else {
         event->ignore();
     }
+}
+
+void MainWindow::dragEnterEvent(QDragEnterEvent* event)
+{
+    if (!firstSupportedDroppedImage(event->mimeData()).isEmpty()) {
+        event->acceptProposedAction();
+        return;
+    }
+    QMainWindow::dragEnterEvent(event);
+}
+
+void MainWindow::dropEvent(QDropEvent* event)
+{
+    const QString path = firstSupportedDroppedImage(event->mimeData());
+    if (path.isEmpty()) {
+        QMainWindow::dropEvent(event);
+        return;
+    }
+
+    event->acceptProposedAction();
+    loadImageFromPath(path);
 }
 
 // ==============================================================================
@@ -2354,7 +4656,10 @@ void MainWindow::onDebounceFired()
     // Suppressed during project load: applyLookToUi runs as part of the
     // load and its render kick would otherwise dirty the freshly-loaded
     // project.
-    if (!m_isLoadingProject) markDirty();
+    if (!m_isLoadingProject) {
+        markDirty();
+        updateCurrentHistorySnapshot();
+    }
     requestRender();
 }
 
@@ -2418,11 +4723,13 @@ void MainWindow::onRenderFinished(quint64 generation, QImage result)
     // (~3 ms at the cap of 250K samples) so doing this synchronously on
     // the UI thread per render is fine.
     if (m_histogramWidget) m_histogramWidget->setImage(m_processed);
+    updateNavigatorPreview();
 
     // Mirror to the secondary viewer if it's open. The viewer holds an
     // implicitly-shared copy of the QImage — no per-pixel work, just a
     // refcount bump. setImage() repaints if the image actually changed.
     if (m_secondaryViewer) m_secondaryViewer->setImage(m_processed);
+    saveActiveDocumentState();
 }
 
 // ==============================================================================
@@ -2706,6 +5013,7 @@ void MainWindow::buildMenus()
         m_actShowHistogram->setCheckable(true);
         m_actShowHistogram->setChecked(true);
         connect(m_actShowHistogram, &QAction::toggled, this, [this](bool on) {
+            if (on) setAnalysisPanelCollapsed(false);
             if (m_histogramWidget) m_histogramWidget->setVisible(on);
         });
 
@@ -2718,6 +5026,15 @@ void MainWindow::buildMenus()
             // exists). Same toggle mechanic as the chevron buttons.
             const bool wantCollapsed = !on;
             if (wantCollapsed != m_sidebarCollapsed) onToggleSidebar();
+        });
+
+        m_actShowBottomWorkspace = m->addAction(tr("Show &Bottom Workspace"));
+        m_actShowBottomWorkspace->setCheckable(true);
+        m_actShowBottomWorkspace->setChecked(true);
+        connect(m_actShowBottomWorkspace, &QAction::toggled, this, [this](bool on) {
+            m_bottomWorkspaceEnabled = on;
+            if (m_settings) m_settings->setBottomWorkspaceVisible(on);
+            updateBottomWorkspaceVisibility();
         });
 
         m->addSeparator();
@@ -2753,6 +5070,7 @@ void MainWindow::buildMenus()
         histPanel->setCheckable(true);
         histPanel->setChecked(true);
         connect(histPanel, &QAction::toggled, this, [this](bool on) {
+            if (on) setAnalysisPanelCollapsed(false);
             if (m_histogramWidget) m_histogramWidget->setVisible(on);
             if (m_actShowHistogram) m_actShowHistogram->setChecked(on);
         });
@@ -2771,7 +5089,7 @@ void MainWindow::buildMenus()
 
         auto* nodeGraph = m->addAction(tr("Node Graph..."));
         connect(nodeGraph, &QAction::triggered,
-                this, [this]() { showPlaceholder(this, tr("Node Graph")); });
+                this, &MainWindow::onShowNodeGraph);
     }
 
     // ---- Plugins menu -----------------------------------------------------
@@ -2906,6 +5224,7 @@ void MainWindow::onLoadPreset()
     // can revert. The image, project path, and dirty state are not part
     // of a preset; we leave m_currentImagePath / m_currentProjectPath
     // alone here. applyLookToUi triggers the debounce, which renders.
+    m_nextHistoryLabel = tr("Preset loaded");
     pushUndoSnapshot();
     m_look = loaded;
     applyLookToUi();
@@ -2941,6 +5260,7 @@ void MainWindow::onLoadLut()
         tr("LUT Files (*.cube)"));
     if (path.isEmpty()) return;
 
+    m_nextHistoryLabel = tr("LUT loaded");
     pushUndoSnapshot();
     m_look.grading.lutPath = path;
     // Spec rule: bump opacity to 1.0 if it was 0 — newly-loaded LUTs
@@ -2958,6 +5278,7 @@ void MainWindow::onClearLut()
 {
     if (m_look.grading.lutPath.isEmpty()) return;   // nothing to clear
 
+    m_nextHistoryLabel = tr("LUT cleared");
     pushUndoSnapshot();
     m_look.grading.lutPath.clear();
     m_look.grading.lutOpacity = 1.0f;   // reset to default
@@ -3008,6 +5329,170 @@ void MainWindow::refreshLutWidgets()
 }
 
 // ==============================================================================
+// HDR tone mapping - refresh
+// ==============================================================================
+void MainWindow::refreshHdrWidgets()
+{
+    const auto& h = m_look.hdr;
+
+    if (m_hdrEnabledCheck) {
+        QSignalBlocker b(m_hdrEnabledCheck);
+        m_hdrEnabledCheck->setChecked(h.enabled);
+    }
+
+    auto setSlider = [&](QSlider* s, QLabel* lbl,
+                         float value, float scale, int decimals) {
+        if (!s) return;
+        const int iv = static_cast<int>(std::lround(value * scale));
+        QSignalBlocker b(s);
+        s->setValue(iv);
+        s->setEnabled(h.enabled);
+        if (lbl) lbl->setText(QString::number(value, 'f', decimals));
+    };
+
+    setSlider(m_hdrExposureBiasSlider, m_hdrExposureBiasValue,
+              h.exposureBias, 100.0f, 2);
+    setSlider(m_hdrHighlightCompressionSlider, m_hdrHighlightCompressionValue,
+              h.highlightCompression, 1.0f, 0);
+    setSlider(m_hdrShoulderStrengthSlider, m_hdrShoulderStrengthValue,
+              h.shoulderStrength, 1.0f, 0);
+    setSlider(m_hdrMidtonePivotSlider, m_hdrMidtonePivotValue,
+              h.midtonePivot, 100.0f, 2);
+    setSlider(m_hdrSaturationPreserveSlider, m_hdrSaturationPreserveValue,
+              h.saturationPreserve, 1.0f, 0);
+}
+
+// ==============================================================================
+// Lens correction — refresh
+//
+// Sync all lens widgets from m_look.lens. Master-enable gates the per-
+// control widgets: when off, sliders / CA checkbox are visually disabled
+// (their values still persist in the Look — this is a UI cue, not a data
+// reset). The master checkbox itself is always editable.
+// ==============================================================================
+void MainWindow::refreshLensWidgets()
+{
+    const auto& lp = m_look.lens;
+
+    if (m_lensEnabledCheck) {
+        QSignalBlocker b(m_lensEnabledCheck);
+        m_lensEnabledCheck->setChecked(lp.enabled);
+    }
+    if (m_lensRemoveCaCheck) {
+        QSignalBlocker b(m_lensRemoveCaCheck);
+        m_lensRemoveCaCheck->setChecked(lp.removeChromaticAberration);
+        m_lensRemoveCaCheck->setEnabled(lp.enabled);
+    }
+
+    auto setSlider = [&](QSlider* s, QLabel* lbl, float v) {
+        if (!s) return;
+        const int iv = static_cast<int>(std::lround(v));
+        QSignalBlocker b(s);
+        s->setValue(iv);
+        s->setEnabled(lp.enabled);
+        if (lbl) lbl->setText(QString::number(iv));
+    };
+    setSlider(m_lensDistortionSlider,   m_lensDistortionValue,   lp.distortion);
+    setSlider(m_lensVignettingSlider,   m_lensVignettingValue,   lp.vignetting);
+    setSlider(m_lensPurpleFringeSlider, m_lensPurpleFringeValue, lp.purpleFringe);
+    setSlider(m_lensGreenFringeSlider,  m_lensGreenFringeValue,  lp.greenFringe);
+}
+
+// ==============================================================================
+// Transform refresh
+// ==============================================================================
+void MainWindow::updateCropAspectConstraint()
+{
+    if (!m_previewLabel) return;
+
+    double ratio = 0.0;
+    const int index = m_cropAspectCombo ? m_cropAspectCombo->currentIndex() : 0;
+    switch (index) {
+    case 1:
+        if (!m_previewSource.isNull() && m_previewSource.height() > 0) {
+            ratio = static_cast<double>(m_previewSource.width())
+                  / static_cast<double>(m_previewSource.height());
+        }
+        break;
+    case 2: ratio = 1.0; break;
+    case 3: ratio = 4.0 / 5.0; break;
+    case 4: ratio = 5.0 / 4.0; break;
+    case 5: ratio = 3.0 / 2.0; break;
+    case 6: ratio = 2.0 / 3.0; break;
+    case 7: ratio = 16.0 / 9.0; break;
+    case 8: ratio = 9.0 / 16.0; break;
+    default: break;
+    }
+
+    const bool locked = m_cropLockAspectCheck && m_cropLockAspectCheck->isChecked();
+    m_previewLabel->setCropAspectRatio(ratio);
+    m_previewLabel->setCropAspectRatioLocked(locked && ratio > 0.0);
+}
+
+void MainWindow::refreshTransformWidgets()
+{
+    const auto& tp = m_look.transform;
+
+    if (m_previewLabel) {
+        m_previewLabel->setCropRect(tp.cropRect);
+        updateCropAspectConstraint();
+    }
+    if (m_cropToolBtn) {
+        QSignalBlocker b(m_cropToolBtn);
+        m_cropToolBtn->setChecked(m_previewLabel && m_previewLabel->isCropOverlayActive());
+    }
+    if (m_transformFlipHorizontalBtn) {
+        QSignalBlocker b(m_transformFlipHorizontalBtn);
+        m_transformFlipHorizontalBtn->setChecked(tp.flipHorizontal);
+    }
+    if (m_transformFlipVerticalBtn) {
+        QSignalBlocker b(m_transformFlipVerticalBtn);
+        m_transformFlipVerticalBtn->setChecked(tp.flipVertical);
+    }
+    if (m_straightenSlider) {
+        QSignalBlocker b(m_straightenSlider);
+        m_straightenSlider->setValue(
+            static_cast<int>(std::lround(tp.straightenAngle * 10.0f)));
+    }
+    if (m_straightenValue)
+        m_straightenValue->setText(QString::number(tp.straightenAngle, 'f', 1));
+}
+
+// ==============================================================================
+// Details — refresh
+// ==============================================================================
+void MainWindow::refreshDetailsWidgets()
+{
+    const auto& d = m_look.details;
+
+    auto setSlider = [](QSlider* s, QLabel* lbl,
+                        float value, float scale, int decimals) {
+        if (!s) return;
+        const int iv = static_cast<int>(std::lround(value * scale));
+        QSignalBlocker b(s);
+        s->setValue(iv);
+        if (lbl) lbl->setText(QString::number(value, 'f', decimals));
+    };
+
+    setSlider(m_sharpeningAmountSlider,  m_sharpeningAmountValue,
+              d.sharpeningAmount, 1.0f, 0);
+    setSlider(m_sharpeningRadiusSlider,  m_sharpeningRadiusValue,
+              d.sharpeningRadius, 10.0f, 1);
+    setSlider(m_sharpeningDetailSlider,  m_sharpeningDetailValue,
+              d.sharpeningDetail, 1.0f, 0);
+    setSlider(m_sharpeningMaskingSlider, m_sharpeningMaskingValue,
+              d.sharpeningMasking, 1.0f, 0);
+    setSlider(m_luminanceNrSlider,       m_luminanceNrValue,
+              d.luminanceNR, 1.0f, 0);
+    setSlider(m_luminanceDetailSlider,   m_luminanceDetailValue,
+              d.luminanceDetail, 1.0f, 0);
+    setSlider(m_colorNrSlider,           m_colorNrValue,
+              d.colorNR, 1.0f, 0);
+    setSlider(m_colorDetailSlider,       m_colorDetailValue,
+              d.colorDetail, 1.0f, 0);
+}
+
+// ==============================================================================
 // Local masks — slot implementations
 //
 // All mutations push an undo snapshot first. After mutating m_look, we
@@ -3022,6 +5507,7 @@ void MainWindow::refreshLutWidgets()
 // ==============================================================================
 void MainWindow::addMaskCommon(lps::LocalAdjustment&& mask, const QString& kind)
 {
+    m_nextHistoryLabel = tr("%1 mask added").arg(kind);
     pushUndoSnapshot();
 
     // Default name pattern: "Linear 1", "Radial 2", etc. — index by total
@@ -3069,6 +5555,10 @@ void MainWindow::onAddBrushMask()
 {
     lps::LocalAdjustment m;
     m.type = lps::MaskType::Brush;
+    m.brushSize = 0.08f;
+    m.feather   = 0.5f;
+    m.flow      = 0.5f;
+    m.density   = 1.0f;
     // Brush is a placeholder — V1 LocalAdjustmentEngine treats brush masks
     // as zero-weight everywhere, so this entry is inert until the brush
     // UI lands. The data round-trips through save/load correctly, which
@@ -3083,6 +5573,7 @@ void MainWindow::onDeleteSelectedMask()
         return;
     }
 
+    m_nextHistoryLabel = tr("Mask deleted");
     pushUndoSnapshot();
 
     m_look.localAdjustments.erase(
@@ -3127,6 +5618,7 @@ void MainWindow::onMaskItemChanged(QListWidgetItem* item)
     const bool checked = (item->checkState() == Qt::Checked);
     if (m_look.localAdjustments[row].enabled == checked) return;
 
+    m_nextHistoryLabel = tr("Mask visibility changed");
     pushUndoSnapshot();
     m_look.localAdjustments[row].enabled = checked;
     refreshUndoRedoActions();
@@ -3183,6 +5675,8 @@ void MainWindow::refreshMaskWidgets()
     // Sync the detail sliders + status label.
     const bool hasSelection = (m_selectedMaskIndex >= 0 &&
                                 m_selectedMaskIndex < total);
+    const bool brushSelection = hasSelection &&
+        m_look.localAdjustments[m_selectedMaskIndex].type == lps::MaskType::Brush;
     if (m_maskDeleteBtn) m_maskDeleteBtn->setEnabled(hasSelection);
 
     auto setSlider = [](QSlider* s, QLabel* lbl, int v) {
@@ -3205,6 +5699,9 @@ void MainWindow::refreshMaskWidgets()
     setEnabled(m_maskFeatherSlider);
     setEnabled(m_maskDensitySlider);
     setEnabled(m_maskFlowSlider);
+    if (m_maskBrushSizeSlider) m_maskBrushSizeSlider->setEnabled(brushSelection);
+    if (m_maskBrushEraseCheck) m_maskBrushEraseCheck->setEnabled(brushSelection);
+    if (m_maskResetBrushBtn) m_maskResetBrushBtn->setEnabled(brushSelection);
     if (m_maskNameEdit)    m_maskNameEdit->setEnabled(hasSelection);
     if (m_maskInvertCheck) m_maskInvertCheck->setEnabled(hasSelection);
     if (m_maskResetGeoBtn) m_maskResetGeoBtn->setEnabled(hasSelection);
@@ -3231,6 +5728,8 @@ void MainWindow::refreshMaskWidgets()
                   static_cast<int>(std::lround(la.density * 100.0f)));
         setSlider(m_maskFlowSlider, m_maskFlowValue,
                   static_cast<int>(std::lround(la.flow * 100.0f)));
+        setSlider(m_maskBrushSizeSlider, m_maskBrushSizeValue,
+                  static_cast<int>(std::lround(la.brushSize * 1000.0f)));
 
         if (m_maskNameEdit) {
             QSignalBlocker b(m_maskNameEdit);
@@ -3240,11 +5739,19 @@ void MainWindow::refreshMaskWidgets()
             QSignalBlocker b(m_maskInvertCheck);
             m_maskInvertCheck->setChecked(la.invert);
         }
+        if (m_maskBrushEraseCheck) {
+            QSignalBlocker b(m_maskBrushEraseCheck);
+            m_maskBrushEraseCheck->setChecked(la.brushEraseMode);
+        }
 
         if (m_maskStatusLabel) {
-            m_maskStatusLabel->setText(
-                tr("Selected: %1").arg(la.name.isEmpty()
-                                       ? tr("(unnamed)") : la.name));
+            QString status = tr("Selected: %1").arg(la.name.isEmpty()
+                                                    ? tr("(unnamed)") : la.name);
+            if (la.type == lps::MaskType::Brush) {
+                status += tr(" - %1 stroke(s)").arg(
+                    static_cast<int>(la.brushStrokes.size()));
+            }
+            m_maskStatusLabel->setText(status);
         }
     } else {
         // Zero out the sliders visually so an old selection's values
@@ -3259,6 +5766,7 @@ void MainWindow::refreshMaskWidgets()
         setSlider(m_maskFeatherSlider, m_maskFeatherValue, 50);
         setSlider(m_maskDensitySlider, m_maskDensityValue, 100);
         setSlider(m_maskFlowSlider,    m_maskFlowValue,    100);
+        setSlider(m_maskBrushSizeSlider, m_maskBrushSizeValue, 80);
         if (m_maskNameEdit) {
             QSignalBlocker b(m_maskNameEdit);
             m_maskNameEdit->clear();
@@ -3266,6 +5774,10 @@ void MainWindow::refreshMaskWidgets()
         if (m_maskInvertCheck) {
             QSignalBlocker b(m_maskInvertCheck);
             m_maskInvertCheck->setChecked(false);
+        }
+        if (m_maskBrushEraseCheck) {
+            QSignalBlocker b(m_maskBrushEraseCheck);
+            m_maskBrushEraseCheck->setChecked(false);
         }
 
         if (m_maskStatusLabel) {
@@ -3319,12 +5831,33 @@ void MainWindow::onMaskGeometryChangedFromPreview()
     if (m_debounce) m_debounce->start();
 }
 
+void MainWindow::onResetBrushMask()
+{
+    if (m_selectedMaskIndex < 0 ||
+        m_selectedMaskIndex >= static_cast<int>(m_look.localAdjustments.size())) {
+        return;
+    }
+    auto& mask = m_look.localAdjustments[m_selectedMaskIndex];
+    if (mask.type != lps::MaskType::Brush) return;
+
+    m_nextHistoryLabel = tr("Brush mask reset");
+    pushUndoSnapshot();
+    mask.brushStrokes.clear();
+    mask.brushEraseMode = false;
+    if (m_previewLabel) m_previewLabel->setActiveMask(&mask);
+    refreshMaskWidgets();
+    refreshUndoRedoActions();
+    markDirty();
+    if (m_debounce) m_debounce->start();
+}
+
 void MainWindow::onResetMaskGeometry()
 {
     if (m_selectedMaskIndex < 0 ||
         m_selectedMaskIndex >= static_cast<int>(m_look.localAdjustments.size())) {
         return;
     }
+    m_nextHistoryLabel = tr("Mask geometry reset");
     pushUndoSnapshot();
 
     auto& mask = m_look.localAdjustments[m_selectedMaskIndex];
@@ -3340,7 +5873,9 @@ void MainWindow::onResetMaskGeometry()
         mask.feather = 0.5f;
         break;
     case lps::MaskType::Brush:
-        mask.brushStamps.clear();
+        mask.brushStrokes.clear();
+        mask.brushSize = 0.08f;
+        mask.feather = 0.5f;
         break;
     }
     mask.invert  = false;
@@ -3367,6 +5902,7 @@ void MainWindow::onResetMaskGeometry()
 // ==============================================================================
 void MainWindow::onAddLayer()
 {
+    m_nextHistoryLabel = tr("Layer added");
     pushUndoSnapshot();
 
     lps::AdjustmentLayer layer;
@@ -3391,6 +5927,7 @@ void MainWindow::onDuplicateLayer()
         return;
     }
 
+    m_nextHistoryLabel = tr("Layer duplicated");
     pushUndoSnapshot();
 
     // Deep copy: AdjustmentLayer is value-semantic (Look + scalars +
@@ -3416,6 +5953,7 @@ void MainWindow::onDeleteSelectedLayer()
         return;
     }
 
+    m_nextHistoryLabel = tr("Layer deleted");
     pushUndoSnapshot();
 
     m_look.adjustmentLayers.erase(
@@ -3449,6 +5987,7 @@ void MainWindow::onLayerItemChanged(QListWidgetItem* item)
     const bool checked = (item->checkState() == Qt::Checked);
     if (m_look.adjustmentLayers[row].enabled == checked) return;
 
+    m_nextHistoryLabel = tr("Layer visibility changed");
     pushUndoSnapshot();
     m_look.adjustmentLayers[row].enabled = checked;
     refreshUndoRedoActions();
@@ -3482,6 +6021,7 @@ void MainWindow::onLayerBlendModeChanged(int comboIndex)
     auto& layer = m_look.adjustmentLayers[m_selectedLayerIndex];
     const auto newMode = static_cast<lps::BlendMode>(comboIndex);
     if (layer.blendMode == newMode) return;
+    m_nextHistoryLabel = tr("Layer blend mode changed");
     pushUndoSnapshot();
     layer.blendMode = newMode;
     refreshUndoRedoActions();
@@ -3607,8 +6147,10 @@ void MainWindow::buildGradingWheel(QWidget* parent, QVBoxLayout* col,
     header->setAutoRaise(true);
     header->setCursor(Qt::PointingHandCursor);
     header->setStyleSheet(
-        "QToolButton { color: #b0b0b6; text-align: left; padding: 2px 4px; }"
-        "QToolButton:hover { color: #d0d0d4; }");
+        "QToolButton { color: #B8BDC6; text-align: left; padding: 4px 6px;"
+        "              background: #16181D; border: 1px solid #2A2D35;"
+        "              border-radius: 7px; }"
+        "QToolButton:hover { color: #CCFF00; border-color: #3D424E; }");
     header->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
     col->addWidget(header);
     w.header = header;
@@ -3617,9 +6159,15 @@ void MainWindow::buildGradingWheel(QWidget* parent, QVBoxLayout* col,
     // below, plus a per-wheel reset button. Parented to a container so
     // we can toggle the whole group via setVisible.
     auto* box = new QWidget(parent);
+    box->setObjectName(QStringLiteral("gradingWheelBox"));
+    box->setStyleSheet(
+        "QWidget#gradingWheelBox { background: #111318; border: 1px solid #2A2D35;"
+        "                          border-radius: 8px; }"
+        "QLabel { border: 0; background: transparent; }"
+        "QSlider { border: 0; background: transparent; }");
     auto* boxLay = new QVBoxLayout(box);
-    boxLay->setContentsMargins(8, 0, 0, 0);
-    boxLay->setSpacing(4);
+    boxLay->setContentsMargins(8, 8, 8, 8);
+    boxLay->setSpacing(6);
 
     // Wheel + small numeric readout row. The readout shows the current
     // hue (deg) and sat (%) so users have a quantitative reference.
@@ -3650,7 +6198,10 @@ void MainWindow::buildGradingWheel(QWidget* parent, QVBoxLayout* col,
     w.resetBtn = new QPushButton(tr("Reset"), box);
     w.resetBtn->setCursor(Qt::PointingHandCursor);
     w.resetBtn->setStyleSheet(
-        "QPushButton { padding: 2px 6px; font-size: 10px; }");
+        "QPushButton { padding: 3px 7px; font-size: 10px;"
+        "              background: #1E2026; border: 1px solid #2A2D35;"
+        "              border-radius: 6px; }"
+        "QPushButton:hover { border-color: #CCFF00; color: #CCFF00; }");
     readout->addWidget(w.resetBtn);
     readout->addStretch(1);
 
@@ -3699,6 +6250,7 @@ void MainWindow::buildGradingWheel(QWidget* parent, QVBoxLayout* col,
     });
     connect(w.wheel, &ColorWheelWidget::resetRequested, this,
             [this, wheelIndex]() {
+        m_nextHistoryLabel = tr("Color grading reset");
         pushUndoSnapshot();
         const auto& f = kWheels[wheelIndex];
         m_look.grading.*(f.hue) = 0.0f;
@@ -3736,6 +6288,7 @@ void MainWindow::buildGradingWheel(QWidget* parent, QVBoxLayout* col,
     // Reset button — clears all four fields for this wheel.
     connect(w.resetBtn, &QPushButton::clicked, this,
             [this, wheelIndex]() {
+        m_nextHistoryLabel = tr("Color grading reset");
         pushUndoSnapshot();
         const auto& f = kWheels[wheelIndex];
         m_look.grading.*(f.hue) = 0.0f;
@@ -3823,6 +6376,7 @@ void MainWindow::refreshGradingWidgets()
 // ==============================================================================
 void MainWindow::onResetEdits()
 {
+    m_nextHistoryLabel = tr("Reset edits");
     pushUndoSnapshot();
     m_look = lps::Look{};
     applyLookToUi();
@@ -3833,65 +6387,65 @@ void MainWindow::onResetEdits()
 
 namespace {
 
-// QImage rotation/flip helpers. Wrap QImage::transformed so the call sites
-// stay readable. All transforms preserve format and alpha.
-inline QImage rotated90(const QImage& src, bool clockwise)
+float normalizedTransformDegrees(float degrees)
 {
-    QTransform t;
-    t.rotate(clockwise ? 90.0 : -90.0);
-    return src.transformed(t, Qt::SmoothTransformation);
-}
-inline QImage flipped(const QImage& src, bool horizontal)
-{
-    return src.mirrored(horizontal, !horizontal);
+    degrees = std::fmod(degrees, 360.0f);
+    if (degrees <= -180.0f) degrees += 360.0f;
+    if (degrees >   180.0f) degrees -= 360.0f;
+    return degrees;
 }
 
 } // namespace
 
 void MainWindow::onRotateLeft()
 {
-    if (m_originalFullRes.isNull()) return;
-    m_originalFullRes = rotated90(m_originalFullRes, /*clockwise=*/false);
-    if (!m_previewSource.isNull())
-        m_previewSource = rotated90(m_previewSource, false);
-    m_processed = QImage();   // dimensions changed; render will refresh
-    if (m_previewLabel) m_previewLabel->zoomToFit();   // dimensions changed
-    markDirty();
-    requestRender();
+    m_nextHistoryLabel = tr("Rotate left");
+    pushUndoSnapshot();
+    m_look.transform.rotationDegrees =
+        normalizedTransformDegrees(m_look.transform.rotationDegrees - 90.0f);
+    refreshTransformWidgets();
+    if (m_previewLabel) m_previewLabel->zoomToFit();
+    if (m_debounce) m_debounce->start();
 }
 
 void MainWindow::onRotateRight()
 {
-    if (m_originalFullRes.isNull()) return;
-    m_originalFullRes = rotated90(m_originalFullRes, /*clockwise=*/true);
-    if (!m_previewSource.isNull())
-        m_previewSource = rotated90(m_previewSource, true);
-    m_processed = QImage();
+    m_nextHistoryLabel = tr("Rotate right");
+    pushUndoSnapshot();
+    m_look.transform.rotationDegrees =
+        normalizedTransformDegrees(m_look.transform.rotationDegrees + 90.0f);
+    refreshTransformWidgets();
     if (m_previewLabel) m_previewLabel->zoomToFit();
-    markDirty();
-    requestRender();
+    if (m_debounce) m_debounce->start();
 }
 
 void MainWindow::onFlipHorizontal()
 {
-    if (m_originalFullRes.isNull()) return;
-    m_originalFullRes = flipped(m_originalFullRes, /*horizontal=*/true);
-    if (!m_previewSource.isNull())
-        m_previewSource = flipped(m_previewSource, true);
-    m_processed = QImage();
-    markDirty();
-    requestRender();
+    m_nextHistoryLabel = tr("Flip horizontal");
+    pushUndoSnapshot();
+    m_look.transform.flipHorizontal = !m_look.transform.flipHorizontal;
+    refreshTransformWidgets();
+    if (m_debounce) m_debounce->start();
 }
 
 void MainWindow::onFlipVertical()
 {
-    if (m_originalFullRes.isNull()) return;
-    m_originalFullRes = flipped(m_originalFullRes, /*horizontal=*/false);
-    if (!m_previewSource.isNull())
-        m_previewSource = flipped(m_previewSource, false);
-    m_processed = QImage();
-    markDirty();
-    requestRender();
+    m_nextHistoryLabel = tr("Flip vertical");
+    pushUndoSnapshot();
+    m_look.transform.flipVertical = !m_look.transform.flipVertical;
+    refreshTransformWidgets();
+    if (m_debounce) m_debounce->start();
+}
+
+void MainWindow::onResetTransform()
+{
+    if (m_look.transform.isIdentity()) return;
+    m_nextHistoryLabel = tr("Transform reset");
+    pushUndoSnapshot();
+    m_look.transform.reset();
+    refreshTransformWidgets();
+    if (m_previewLabel) m_previewLabel->zoomToFit();
+    if (m_debounce) m_debounce->start();
 }
 
 void MainWindow::onCopyLook()
@@ -3917,6 +6471,7 @@ void MainWindow::onPasteLook()
     QString lookErr;
     if (!lps::LookSerializer::fromJson(doc.object(), loaded, &lookErr)) return;
 
+    m_nextHistoryLabel = tr("Look pasted");
     pushUndoSnapshot();
     m_look = loaded;
     applyLookToUi();
@@ -3925,7 +6480,118 @@ void MainWindow::onPasteLook()
 
 void MainWindow::onPreferences()
 {
-    showPlaceholder(this, tr("Preferences"));
+    if (!m_settings)
+        m_settings = std::make_unique<lps::SettingsManager>();
+
+    QDialog dialog(this);
+    dialog.setWindowTitle(tr("Preferences"));
+    dialog.resize(560, 380);
+
+    auto* root = new QVBoxLayout(&dialog);
+    root->setContentsMargins(14, 14, 14, 14);
+    root->setSpacing(10);
+
+    auto* tabs = new QTabWidget(&dialog);
+    root->addWidget(tabs, 1);
+
+    auto* generalTab = new QWidget(tabs);
+    auto* generalForm = new QFormLayout(generalTab);
+    generalForm->setContentsMargins(16, 16, 16, 16);
+    generalForm->setSpacing(10);
+
+    auto* welcomeCheck = new QCheckBox(tr("Show Welcome screen on startup"), generalTab);
+    welcomeCheck->setChecked(m_settings->showWelcomeOnStartup());
+    generalForm->addRow(QString(), welcomeCheck);
+
+    auto* lastOpenEdit = new QLineEdit(m_settings->lastOpenFolder(), generalTab);
+    auto* lastOpenRow = new QWidget(generalTab);
+    auto* lastOpenLay = new QHBoxLayout(lastOpenRow);
+    lastOpenLay->setContentsMargins(0, 0, 0, 0);
+    lastOpenLay->addWidget(lastOpenEdit, 1);
+    auto* lastOpenBrowse = new QPushButton(tr("Browse"), lastOpenRow);
+    lastOpenLay->addWidget(lastOpenBrowse);
+    connect(lastOpenBrowse, &QPushButton::clicked, &dialog, [this, lastOpenEdit]() {
+        const QString dir = QFileDialog::getExistingDirectory(
+            this, tr("Last Open Folder"), lastOpenEdit->text());
+        if (!dir.isEmpty()) lastOpenEdit->setText(dir);
+    });
+    generalForm->addRow(tr("Last Open Folder"), lastOpenRow);
+
+    auto* exportEdit = new QLineEdit(m_settings->defaultExportFolder(), generalTab);
+    auto* exportRow = new QWidget(generalTab);
+    auto* exportLay = new QHBoxLayout(exportRow);
+    exportLay->setContentsMargins(0, 0, 0, 0);
+    exportLay->addWidget(exportEdit, 1);
+    auto* exportBrowse = new QPushButton(tr("Browse"), exportRow);
+    exportLay->addWidget(exportBrowse);
+    connect(exportBrowse, &QPushButton::clicked, &dialog, [this, exportEdit]() {
+        const QString dir = QFileDialog::getExistingDirectory(
+            this, tr("Default Export Folder"), exportEdit->text());
+        if (!dir.isEmpty()) exportEdit->setText(dir);
+    });
+    generalForm->addRow(tr("Default Export Folder"), exportRow);
+    tabs->addTab(generalTab, tr("General"));
+
+    auto* appearanceTab = new QWidget(tabs);
+    auto* appearanceForm = new QFormLayout(appearanceTab);
+    appearanceForm->setContentsMargins(16, 16, 16, 16);
+    auto* themeCombo = new QComboBox(appearanceTab);
+    themeCombo->addItems(QStringList{ tr("Dark"), tr("System") });
+    const int themeIndex = themeCombo->findText(m_settings->themeName());
+    if (themeIndex >= 0) themeCombo->setCurrentIndex(themeIndex);
+    appearanceForm->addRow(tr("Theme"), themeCombo);
+    tabs->addTab(appearanceTab, tr("Appearance"));
+
+    auto* performanceTab = new QWidget(tabs);
+    auto* performanceForm = new QFormLayout(performanceTab);
+    performanceForm->setContentsMargins(16, 16, 16, 16);
+    auto* backendCombo = new QComboBox(performanceTab);
+    backendCombo->addItems(QStringList{ tr("CPU"), tr("GPU (future)") });
+    const int backendIndex = backendCombo->findText(m_settings->renderBackend());
+    if (backendIndex >= 0) backendCombo->setCurrentIndex(backendIndex);
+    performanceForm->addRow(tr("Render Backend"), backendCombo);
+    tabs->addTab(performanceTab, tr("Performance"));
+
+    auto* pluginsTab = new QWidget(tabs);
+    auto* pluginsLay = new QVBoxLayout(pluginsTab);
+    pluginsLay->setContentsMargins(16, 16, 16, 16);
+    pluginsLay->setSpacing(10);
+    if (!m_pluginManager)
+        m_pluginManager = std::make_unique<lps::PluginManager>();
+    auto* pluginPath = new QLabel(m_pluginManager->pluginsDirPath(), pluginsTab);
+    pluginPath->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    pluginsLay->addWidget(new QLabel(tr("Plugins Folder"), pluginsTab));
+    pluginsLay->addWidget(pluginPath);
+    auto* pluginBtns = new QHBoxLayout();
+    auto* openPlugins = new QPushButton(tr("Open Plugins Folder"), pluginsTab);
+    auto* managerBtn = new QPushButton(tr("Plugin Manager"), pluginsTab);
+    pluginBtns->addWidget(openPlugins);
+    pluginBtns->addWidget(managerBtn);
+    pluginBtns->addStretch(1);
+    pluginsLay->addLayout(pluginBtns);
+    pluginsLay->addStretch(1);
+    connect(openPlugins, &QPushButton::clicked,
+            this, &MainWindow::onOpenPluginsFolder);
+    connect(managerBtn, &QPushButton::clicked,
+            this, &MainWindow::onPluginManager);
+    tabs->addTab(pluginsTab, tr("Plugins"));
+
+    auto* buttons = new QDialogButtonBox(
+        QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    root->addWidget(buttons);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+
+    if (dialog.exec() != QDialog::Accepted) return;
+
+    m_settings->setShowWelcomeOnStartup(welcomeCheck->isChecked());
+    m_settings->setLastOpenFolder(lastOpenEdit->text());
+    m_settings->setDefaultExportFolder(exportEdit->text());
+    m_settings->setThemeName(themeCombo->currentText());
+    m_settings->setRenderBackend(backendCombo->currentText());
+
+    if (m_welcomeScreen)
+        m_welcomeScreen->setShowOnStartup(welcomeCheck->isChecked());
 }
 
 // ==============================================================================
@@ -3996,6 +6662,37 @@ void MainWindow::onSecondaryViewer()
 }
 
 // ==============================================================================
+// Node Graph
+//
+// Lazy-creates the dock + widget on first call. Subsequent calls just
+// re-show and raise the dock. The dock starts attached at the bottom
+// per spec; the user can drag it to float, attach to other edges, or
+// close it (close = hide, not destroy — same pattern as the secondary
+// viewer).
+//
+// The node graph is purely visual in V1. Selecting / panning / zooming
+// inside it doesn't affect the rendered image. Engine code is unchanged.
+// ==============================================================================
+void MainWindow::onShowNodeGraph()
+{
+    if (m_bottomPanelTabs) m_bottomPanelTabs->setCurrentIndex(0);
+    if (!m_nodeGraphDock) return;
+    m_bottomWorkspaceEnabled = true;
+    if (m_settings) m_settings->setBottomWorkspaceVisible(true);
+    setBottomWorkspaceCollapsed(false);
+    if (m_actShowBottomWorkspace) {
+        QSignalBlocker block(m_actShowBottomWorkspace);
+        m_actShowBottomWorkspace->setChecked(true);
+    }
+    if (!m_editorWorkspaceActive) {
+        updateBottomWorkspaceVisibility();
+        return;
+    }
+    m_nodeGraphDock->show();
+    m_nodeGraphDock->raise();
+}
+
+// ==============================================================================
 // Window-menu slots
 // ==============================================================================
 void MainWindow::onResetWorkspaceLayout()
@@ -4003,9 +6700,19 @@ void MainWindow::onResetWorkspaceLayout()
     // Only persistent layout state today is the sidebar collapse. Reset =
     // expand the sidebar and show the histogram.
     if (m_sidebarCollapsed) onToggleSidebar();
+    setAnalysisPanelCollapsed(false);
     if (m_histogramWidget)  m_histogramWidget->setVisible(true);
     if (m_actShowHistogram) m_actShowHistogram->setChecked(true);
     if (m_actShowControls)  m_actShowControls->setChecked(true);
+    m_bottomWorkspaceEnabled = true;
+    if (m_settings) m_settings->setBottomWorkspaceVisible(true);
+    setBottomWorkspaceCollapsed(false);
+    if (m_actShowBottomWorkspace) m_actShowBottomWorkspace->setChecked(true);
+    updateBottomWorkspaceVisibility();
+    if (m_editorWorkspaceActive && m_nodeGraphDock) {
+        m_nodeGraphDock->setFloating(false);
+        addDockWidget(Qt::BottomDockWidgetArea, m_nodeGraphDock);
+    }
 }
 
 void MainWindow::onSaveWorkspaceLayout()
@@ -4020,49 +6727,213 @@ void MainWindow::onSaveWorkspaceLayout()
 // ==============================================================================
 void MainWindow::onPluginManager()
 {
-    QMessageBox box(this);
-    box.setWindowTitle(tr("Lumen Plugin Manager"));
-    box.setText(tr("Plugin management is not yet available.\n\n"
-                   "Future versions will let you browse, enable, "
-                   "disable, and update plugins from this dialog."));
-    box.setIcon(QMessageBox::Information);
-    box.exec();
+    if (!m_pluginManager)
+        m_pluginManager = std::make_unique<lps::PluginManager>();
+    m_pluginManager->reload();
+
+    QDialog dialog(this);
+    dialog.setWindowTitle(tr("Lumen Plugin Manager"));
+    dialog.resize(760, 460);
+
+    auto* root = new QVBoxLayout(&dialog);
+    root->setContentsMargins(14, 14, 14, 14);
+    root->setSpacing(10);
+
+    auto* title = new QLabel(tr("Installed Plugins"), &dialog);
+    QFont titleFont = title->font();
+    titleFont.setPointSize(titleFont.pointSize() + 2);
+    titleFont.setBold(true);
+    title->setFont(titleFont);
+    root->addWidget(title);
+
+    auto* pathLabel = new QLabel(m_pluginManager->pluginsDirPath(), &dialog);
+    pathLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    pathLabel->setObjectName(QStringLiteral("subtleLabel"));
+    root->addWidget(pathLabel);
+
+    auto* table = new QTableWidget(&dialog);
+    table->setColumnCount(4);
+    table->setHorizontalHeaderLabels({
+        tr("Plugin"),
+        tr("Version"),
+        tr("Type"),
+        tr("Enabled"),
+    });
+    table->verticalHeader()->hide();
+    table->horizontalHeader()->setStretchLastSection(false);
+    table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+    table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    table->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+    table->horizontalHeader()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
+    table->setSelectionBehavior(QAbstractItemView::SelectRows);
+    table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    table->setAlternatingRowColors(true);
+    root->addWidget(table, 1);
+
+    auto populateTable = [this, table]() {
+        QSignalBlocker block(table);
+        table->clearSpans();
+        const QList<lps::PluginInfo> plugins = m_pluginManager
+            ? m_pluginManager->installedPlugins()
+            : QList<lps::PluginInfo>();
+
+        if (plugins.isEmpty()) {
+            table->setRowCount(1);
+            table->setSpan(0, 0, 1, 4);
+            auto* empty = new QTableWidgetItem(
+                tr("No plugins installed. Use Install Plugin to copy a folder or ZIP package."));
+            empty->setFlags(Qt::ItemIsEnabled);
+            table->setItem(0, 0, empty);
+            return;
+        }
+
+        const int pluginCount = static_cast<int>(plugins.size());
+        table->setRowCount(pluginCount);
+        for (int row = 0; row < pluginCount; ++row) {
+            const lps::PluginInfo& plugin = plugins.at(row);
+            const QString name = plugin.name.isEmpty() ? plugin.id : plugin.name;
+            const QString tooltip = plugin.valid
+                ? tr("%1\nAuthor: %2\nPath: %3")
+                    .arg(plugin.description, plugin.author, plugin.path)
+                : tr("%1\nPath: %2")
+                    .arg(plugin.error, plugin.path);
+
+            auto* nameItem = new QTableWidgetItem(plugin.valid
+                ? name
+                : tr("%1  (invalid)").arg(name));
+            nameItem->setToolTip(tooltip);
+            nameItem->setFlags(Qt::ItemIsEnabled | Qt::ItemIsSelectable);
+
+            auto* versionItem = new QTableWidgetItem(plugin.version);
+            versionItem->setToolTip(tooltip);
+            versionItem->setFlags(Qt::ItemIsEnabled | Qt::ItemIsSelectable);
+
+            auto* typeItem = new QTableWidgetItem(plugin.type);
+            typeItem->setToolTip(tooltip);
+            typeItem->setFlags(Qt::ItemIsEnabled | Qt::ItemIsSelectable);
+
+            auto* enabledItem = new QTableWidgetItem();
+            enabledItem->setToolTip(tooltip);
+            enabledItem->setData(Qt::UserRole, plugin.id);
+            enabledItem->setFlags(Qt::ItemIsEnabled | Qt::ItemIsSelectable);
+            if (plugin.valid) {
+                enabledItem->setFlags(enabledItem->flags() | Qt::ItemIsUserCheckable);
+                enabledItem->setCheckState(plugin.enabled ? Qt::Checked : Qt::Unchecked);
+            } else {
+                enabledItem->setText(QStringLiteral("-"));
+            }
+
+            table->setItem(row, 0, nameItem);
+            table->setItem(row, 1, versionItem);
+            table->setItem(row, 2, typeItem);
+            table->setItem(row, 3, enabledItem);
+        }
+    };
+
+    connect(table, &QTableWidget::itemChanged, &dialog,
+            [this, populateTable](QTableWidgetItem* item) {
+        if (!item || item->column() != 3 || !m_pluginManager) return;
+        const QString pluginId = item->data(Qt::UserRole).toString();
+        if (pluginId.isEmpty()) return;
+
+        QString error;
+        const bool enabled = item->checkState() == Qt::Checked;
+        if (!m_pluginManager->setPluginEnabled(pluginId, enabled, &error)) {
+            QMessageBox::warning(this, tr("Plugin Manager"), error);
+        }
+        populateTable();
+    });
+
+    auto* buttons = new QHBoxLayout();
+    buttons->setContentsMargins(0, 0, 0, 0);
+    buttons->setSpacing(8);
+
+    auto* installBtn = new QPushButton(tr("Install Plugin"), &dialog);
+    auto* openFolderBtn = new QPushButton(tr("Open Plugins Folder"), &dialog);
+    auto* reloadBtn = new QPushButton(tr("Reload Plugins"), &dialog);
+    auto* closeBtn = new QPushButton(tr("Close"), &dialog);
+
+    buttons->addWidget(installBtn);
+    buttons->addWidget(openFolderBtn);
+    buttons->addWidget(reloadBtn);
+    buttons->addStretch(1);
+    buttons->addWidget(closeBtn);
+    root->addLayout(buttons);
+
+    connect(installBtn, &QPushButton::clicked, &dialog, [this, populateTable]() {
+        onInstallPlugin();
+        if (m_pluginManager) m_pluginManager->reload();
+        populateTable();
+    });
+    connect(openFolderBtn, &QPushButton::clicked,
+            this, &MainWindow::onOpenPluginsFolder);
+    connect(reloadBtn, &QPushButton::clicked, &dialog, [this, populateTable]() {
+        if (m_pluginManager) m_pluginManager->reload();
+        populateTable();
+    });
+    connect(closeBtn, &QPushButton::clicked, &dialog, &QDialog::accept);
+
+    populateTable();
+    dialog.exec();
 }
 
 void MainWindow::onInstallPlugin()
 {
-    const QString path = QFileDialog::getOpenFileName(
-        this, tr("Install Plugin"),
-        QStandardPaths::writableLocation(QStandardPaths::DownloadLocation),
-        tr("Lumen Plugins (*.plugin);;All Files (*)"));
+    if (!m_pluginManager)
+        m_pluginManager = std::make_unique<lps::PluginManager>();
+
+    QMessageBox choice(this);
+    choice.setWindowTitle(tr("Install Plugin"));
+    choice.setText(tr("Install a plugin folder or copy a ZIP package into the plugins folder."));
+    auto* zipButton = choice.addButton(tr("Select ZIP"), QMessageBox::AcceptRole);
+    auto* folderButton = choice.addButton(tr("Select Folder"), QMessageBox::ActionRole);
+    choice.addButton(QMessageBox::Cancel);
+    choice.exec();
+
+    QString path;
+    if (choice.clickedButton() == zipButton) {
+        path = QFileDialog::getOpenFileName(
+            this, tr("Install Plugin Package"),
+            QStandardPaths::writableLocation(QStandardPaths::DownloadLocation),
+            tr("Plugin Packages (*.zip)"));
+    } else if (choice.clickedButton() == folderButton) {
+        path = QFileDialog::getExistingDirectory(
+            this, tr("Install Plugin Folder"),
+            QStandardPaths::writableLocation(QStandardPaths::DownloadLocation));
+    }
     if (path.isEmpty()) return;
-    // Future: copy to plugins folder and reload. Placeholder for now.
+
+    QString error;
+    if (!m_pluginManager->installPluginFromPath(path, &error)) {
+        QMessageBox::warning(this, tr("Install Plugin"), error);
+        return;
+    }
+
     QMessageBox::information(this, tr("Install Plugin"),
-        tr("Plugin installation is not yet implemented.\n\n"
-           "Selected: %1").arg(path));
+        tr("Plugin copied to:\n%1").arg(m_pluginManager->pluginsDirPath()));
 }
 
 void MainWindow::onReloadPlugins()
 {
     // Placeholder — no plugin runtime exists yet.
-    showPlaceholder(this, tr("Reload Plugins"));
+    if (!m_pluginManager)
+        m_pluginManager = std::make_unique<lps::PluginManager>();
+    m_pluginManager->reload();
+    QMessageBox::information(this, tr("Reload Plugins"),
+        tr("Found %1 plugin item(s).")
+            .arg(static_cast<int>(m_pluginManager->installedPlugins().size())));
 }
 
 void MainWindow::onOpenPluginsFolder()
 {
-    // Resolve plugins folder relative to the running executable. Create
-    // it if missing so users can drop files in immediately.
-    const QString pluginsDir =
-        QCoreApplication::applicationDirPath() + QStringLiteral("/plugins");
-    QDir dir(pluginsDir);
-    if (!dir.exists()) {
-        if (!dir.mkpath(QStringLiteral("."))) {
-            QMessageBox::warning(this, tr("Open Plugins Folder"),
-                tr("Could not create plugins folder:\n%1").arg(pluginsDir));
-            return;
-        }
+    if (!m_pluginManager)
+        m_pluginManager = std::make_unique<lps::PluginManager>();
+    if (!m_pluginManager->ensurePluginsFolder()) {
+        QMessageBox::warning(this, tr("Open Plugins Folder"),
+            m_pluginManager->lastError());
+        return;
     }
-    QDesktopServices::openUrl(QUrl::fromLocalFile(pluginsDir));
+    QDesktopServices::openUrl(QUrl::fromLocalFile(m_pluginManager->pluginsDirPath()));
 }
 
 // ==============================================================================
@@ -4130,10 +7001,13 @@ void MainWindow::onToggleSidebar()
     m_sidebarCollapsed = !m_sidebarCollapsed;
 
     if (m_sidebarCollapsed) {
-        m_sidebarStack->setCurrentWidget(m_sidebarMini);
-        m_sidebarHost->setMaximumWidth(40);
+        m_sidebarHost->setMinimumWidth(0);
+        m_sidebarHost->setMaximumWidth(0);
+        m_sidebarHost->setVisible(false);
     } else {
+        m_sidebarHost->setVisible(true);
         m_sidebarStack->setCurrentWidget(m_sidebarFull);
+        m_sidebarHost->setMinimumWidth(320);
         m_sidebarHost->setMaximumWidth(QWIDGETSIZE_MAX);
     }
 

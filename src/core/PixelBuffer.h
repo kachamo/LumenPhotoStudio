@@ -54,6 +54,8 @@ public:
     int width()  const { return m_width; }
     int height() const { return m_height; }
 
+    void reset(int width, int height, std::vector<float>&& pixels);
+
     // Scanline accessors. `y` is a row index; returned pointer points to the
     // first float (R) of that row. 4 floats per pixel (RGBA), width() pixels.
     float*       scanline(int y)       { return m_pixels.data() + static_cast<size_t>(y) * m_width * 4; }

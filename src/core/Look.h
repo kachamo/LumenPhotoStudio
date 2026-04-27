@@ -17,12 +17,30 @@
 #pragma once
 
 #include <QPointF>
+#include <QRectF>
 #include <QString>
 #include <QVector>
 
 #include <vector>
 
 namespace lps {
+
+// ============================================================================
+// HDR tone mapping (early linear stage, before Tone)
+// ============================================================================
+struct HDRParams
+{
+    bool  enabled              = false;
+    float exposureBias         = 0.0f;    // stops, [-5, +5]
+    float highlightCompression = 50.0f;   // [0, 100]
+    float shoulderStrength     = 50.0f;   // [0, 100]
+    float midtonePivot         = 0.18f;   // linear middle gray, [0.05, 1.0]
+    float saturationPreserve   = 85.0f;   // [0, 100]
+
+    bool isIdentity() const;
+    void clampRanges();
+    void reset();
+};
 
 // ============================================================================
 // Tone (pipeline stage 1)
@@ -208,6 +226,43 @@ struct GradingParams
 };
 
 // ============================================================================
+// Details (pipeline stage after color grading, before effects)
+// ============================================================================
+struct DetailsParams
+{
+    float sharpeningAmount  = 0.0f;   // [0, 150]
+    float sharpeningRadius  = 1.0f;   // [0.5, 3.0]
+    float sharpeningDetail  = 0.0f;   // [0, 100]
+    float sharpeningMasking = 0.0f;   // [0, 100]
+
+    float luminanceNR     = 0.0f;     // [0, 100]
+    float luminanceDetail = 0.0f;     // [0, 100]
+
+    float colorNR     = 0.0f;         // [0, 100]
+    float colorDetail = 0.0f;         // [0, 100]
+
+    bool isIdentity() const;
+    void clampRanges();
+    void reset();
+};
+
+// ============================================================================
+// Transform (pipeline stage after lens correction, before tone)
+// ============================================================================
+struct TransformParams
+{
+    float  rotationDegrees = 0.0f;             // degrees, normalized [-180, +180]
+    bool   flipHorizontal  = false;
+    bool   flipVertical    = false;
+    float  straightenAngle = 0.0f;             // [-10, +10] degrees
+    QRectF cropRect        = QRectF(0, 0, 1, 1); // normalized source rect
+
+    bool isIdentity() const;
+    void clampRanges();
+    void reset();
+};
+
+// ============================================================================
 // Effects (pipeline stage 5)
 // ============================================================================
 struct VignetteParams
@@ -249,6 +304,42 @@ struct EffectsParams
 };
 
 // ============================================================================
+// Lens correction (applied EARLY in the pipeline, before tone)
+//
+// Corrects optical defects from the camera lens — distortion, vignetting,
+// chromatic aberration. Runs first so downstream tonal/color adjustments
+// operate on geometrically and brightness-corrected pixels.
+//
+// V1 scope:
+//   - Vignetting:       real radial brightness compensation, simple model
+//                        (gain = 1 + amount × distance²)
+//   - Distortion:       UI/data persistence only (placeholder engine —
+//                        real barrel/pincushion correction needs a
+//                        separate read buffer + bilinear resample, which
+//                        is a non-trivial follow-up).
+//   - removeChromaticAberration: placeholder boolean (no-op).
+//   - purpleFringe / greenFringe: placeholder sliders (no-op).
+//
+// `enabled` is a master kill switch — when false, the engine is a no-op
+// regardless of the other field values. Useful for users who want to
+// keep their lens settings authored but disable them temporarily for
+// comparison.
+// ============================================================================
+struct LensParams
+{
+    bool  enabled                     = false;
+    bool  removeChromaticAberration   = false;
+    float distortion                  = 0.0f;   // [-100, +100]
+    float vignetting                  = 0.0f;   // [-100, +100]
+    float purpleFringe                = 0.0f;   // [0, 100]   — placeholder
+    float greenFringe                 = 0.0f;   // [0, 100]   — placeholder
+
+    bool isIdentity() const;
+    void clampRanges();
+    void reset();
+};
+
+// ============================================================================
 // Local adjustments (pipeline stage between curves and grading)
 //
 // A LocalAdjustment is a mask + a small set of tone/color parameters that
@@ -274,6 +365,16 @@ enum class MaskType : int
     Brush          = 0,
     LinearGradient = 1,
     RadialGradient = 2,
+};
+
+struct BrushStroke
+{
+    QVector<QPointF> points;              // normalized image coordinates
+    float size    = 0.08f;                // diameter, fraction of shorter edge
+    float feather = 0.5f;                 // [0, 1]
+    float flow    = 1.0f;                 // [0, 1]
+    float density = 1.0f;                 // [0, 1]
+    bool  erase   = false;
 };
 
 struct LocalAdjustment
@@ -312,7 +413,9 @@ struct LocalAdjustment
 
     // Brush placeholder — stored stamps for forward-compatible serialization.
     // V1 doesn't paint anything; the engine treats brush masks as zero-weight.
-    QVector<QPointF> brushStamps;
+    float brushSize = 0.08f;              // diameter, fraction of shorter edge
+    bool  brushEraseMode = false;
+    QVector<BrushStroke> brushStrokes;
 
     // ---- Adjustment values ------------------------------------------------
     // Subset of ToneParams + WhiteBalance, scaled like the global sliders:
@@ -418,11 +521,18 @@ struct Look
     QString name;
     int     schemaVersion = 1;
 
+    HDRParams     hdr;
     ToneParams    tone;
     ColorParams   color;
     CurveParams   curves;
     GradingParams grading;
+    DetailsParams details;
     EffectsParams effects;
+    // Lens correction — applied EARLIEST in the pipeline (before tone),
+    // so downstream stages see geometrically-corrected pixels. V1 has
+    // real vignetting compensation; distortion and CA are placeholders.
+    LensParams    lens;
+    TransformParams transform;
 
     // Local masks. Applied after global tone/color/curves and before grading.
     // Order matters when masks overlap — later masks layer on top of earlier

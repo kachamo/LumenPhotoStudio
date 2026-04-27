@@ -6,7 +6,10 @@
 #include "core/Look.h"
 #include "local/MaskGeometry.h"
 
+#include <QEvent>
 #include <QFontMetrics>
+#include <QKeyEvent>
+#include <QLineF>
 #include <QMouseEvent>
 #include <QPaintEvent>
 #include <QPainter>
@@ -15,6 +18,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <utility>
 
 namespace {
 
@@ -40,6 +44,9 @@ constexpr double kPixelDoublingThreshold = 1.0;
 // during pan. Prevents users from accidentally panning the entire image
 // off-screen with no way to navigate back.
 constexpr double kPanEdgeKeep = 32.0;
+constexpr double kCropMinSize = 0.01;
+constexpr double kCropHandleHitRadius = 12.0;
+constexpr double kCropHandlePaintRadius = 5.0;
 
 } // namespace
 
@@ -51,7 +58,7 @@ PreviewWidget::PreviewWidget(QWidget* parent)
 {
     setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     setMinimumSize(480, 360);
-    setMouseTracking(false);   // we only need drags-with-button-down
+    setMouseTracking(true);
     setAttribute(Qt::WA_StyledBackground, false);
     setFocusPolicy(Qt::ClickFocus);
 }
@@ -199,6 +206,9 @@ QString PreviewWidget::zoomLabelText() const
 // ==============================================================================
 const QImage& PreviewWidget::displayImage() const
 {
+    if (m_cropOverlayActive && !m_originalImage.isNull())
+        return m_originalImage;
+
     // Fall back to whichever image we have if the requested side is null.
     // This matters during the brief window between "first render finished"
     // and "user holds Spacebar" — m_originalImage might be set before
@@ -303,10 +313,16 @@ void PreviewWidget::clampPanOffset()
 void PreviewWidget::paintEvent(QPaintEvent* /*event*/)
 {
     QPainter p(this);
-    p.fillRect(rect(), QColor(32, 32, 34));
+    p.fillRect(rect(), QColor(0x0E, 0x0F, 0x12));
 
     const QImage& img = displayImage();
-    if (img.isNull()) return;
+    if (img.isNull()) {
+        p.setRenderHint(QPainter::Antialiasing, true);
+        p.setPen(QPen(QColor(0x2A, 0x2D, 0x35), 1.0));
+        p.setBrush(Qt::NoBrush);
+        p.drawRoundedRect(rect().adjusted(0, 0, -1, -1), 10, 10);
+        return;
+    }
 
     const double s = effectiveScale();
     p.setRenderHint(QPainter::SmoothPixmapTransform,
@@ -326,6 +342,9 @@ void PreviewWidget::paintEvent(QPaintEvent* /*event*/)
     if (m_activeMask) {
         paintMaskHandles(p);
     }
+    if (m_cropOverlayActive) {
+        paintCropOverlay(p);
+    }
 
     // Zoom-label chip. Top-left corner, small rounded rect with text.
     QFont chipFont = font();
@@ -344,6 +363,11 @@ void PreviewWidget::paintEvent(QPaintEvent* /*event*/)
 
     p.setPen(QColor(220, 220, 225));
     p.drawText(chip, Qt::AlignCenter, label);
+
+    p.setRenderHint(QPainter::Antialiasing, true);
+    p.setPen(QPen(QColor(0x2A, 0x2D, 0x35), 1.0));
+    p.setBrush(Qt::NoBrush);
+    p.drawRoundedRect(rect().adjusted(0, 0, -1, -1), 10, 10);
 }
 
 // ==============================================================================
@@ -374,8 +398,67 @@ void PreviewWidget::resizeEvent(QResizeEvent* event)
 // ==============================================================================
 void PreviewWidget::wheelEvent(QWheelEvent* event)
 {
-    if (!(event->modifiers() & Qt::ControlModifier)) {
-        event->ignore();
+    const bool ctrlDown = bool(event->modifiers() & Qt::ControlModifier);
+
+    if (!ctrlDown && activeMaskIsBrush()
+        && (event->modifiers() & Qt::ShiftModifier)) {
+        if (displayImage().isNull()) { event->ignore(); return; }
+        const int notches = event->angleDelta().y() / 120;
+        if (notches == 0) { event->ignore(); return; }
+        auto* mask = const_cast<lps::LocalAdjustment*>(m_activeMask);
+        mask->brushSize = std::clamp(mask->brushSize + notches * 0.005f,
+                                     0.001f, 1.0f);
+        updateBrushCursor(event->position());
+        update();
+        emit maskBrushSettingsChanged();
+        event->accept();
+        return;
+    }
+
+    if (!ctrlDown) {
+        if (displayImage().isNull() || m_fitMode) {
+            event->ignore();
+            return;
+        }
+
+        const QRectF imgRect = imageRectInWidget();
+        const bool canPanX = imgRect.width()  > width()  + 1.0;
+        const bool canPanY = imgRect.height() > height() + 1.0;
+        if (!canPanX && !canPanY) {
+            event->ignore();
+            return;
+        }
+
+        QPointF panDelta(event->pixelDelta());
+        if (panDelta.isNull()) {
+            const QPoint angle = event->angleDelta();
+            if (angle.isNull()) {
+                event->ignore();
+                return;
+            }
+
+            constexpr double kWheelPanPixelsPerDeltaUnit = 0.6;
+            panDelta = QPointF(angle.x() * kWheelPanPixelsPerDeltaUnit,
+                               angle.y() * kWheelPanPixelsPerDeltaUnit);
+            if (bool(event->modifiers() & Qt::ShiftModifier)
+                && std::fabs(panDelta.x()) < 1e-3) {
+                panDelta.setX(panDelta.y());
+                panDelta.setY(0.0);
+            }
+        }
+
+        if (!canPanX) panDelta.setX(0.0);
+        if (!canPanY) panDelta.setY(0.0);
+        if (std::fabs(panDelta.x()) < 1e-3
+            && std::fabs(panDelta.y()) < 1e-3) {
+            event->ignore();
+            return;
+        }
+
+        m_panOffset += panDelta;
+        clampPanOffset();
+        update();
+        event->accept();
         return;
     }
     if (displayImage().isNull()) { event->ignore(); return; }
@@ -434,6 +517,28 @@ void PreviewWidget::mousePressEvent(QMouseEvent* event)
 {
     if (!hasImage()) { QWidget::mousePressEvent(event); return; }
 
+    if (!m_cropOverlayActive && activeMaskIsBrush() &&
+        event->button() == Qt::LeftButton) {
+        const auto mods = event->modifiers();
+        const bool erase = bool(mods & Qt::AltModifier);
+        const Qt::KeyboardModifiers allowed = Qt::AltModifier;
+        const bool clean = (mods & ~allowed) == Qt::NoModifier;
+        if (clean) {
+            QPointF norm;
+            if (!widgetPosToImageNorm(event->position(), norm)) {
+                event->accept();
+                return;
+            }
+            setFocus(Qt::MouseFocusReason);
+            emit maskHandleDragStarted();
+            beginBrushStroke(event->position(), erase);
+            if (m_brushPainting)
+                emit maskGeometryChanged();
+            event->accept();
+            return;
+        }
+    }
+
     // Pan gestures (middle-button or Alt+left) win over sampling — even
     // when sampling is active, the user may want to reposition before
     // their next sample. Sampling intercepts only plain left-click.
@@ -445,6 +550,27 @@ void PreviewWidget::mousePressEvent(QMouseEvent* event)
         m_panButton = event->button();
         m_lastDragPos = event->pos();
         setCursor(Qt::ClosedHandCursor);
+        event->accept();
+        return;
+    }
+
+    if (m_cropOverlayActive && event->button() == Qt::LeftButton &&
+        event->modifiers() == Qt::NoModifier) {
+        setFocus(Qt::MouseFocusReason);
+        const CropHandle hit = hitTestCropHandle(event->position());
+        if (hit != CropHandle::None) {
+            const QPointF imgF = widgetToImage(event->position());
+            const QImage& img = displayImage();
+            if (!img.isNull()) {
+                m_cropDragHandle = hit;
+                m_cropDragStartRect = m_cropRect;
+                m_cropDragStartNorm = QPointF(imgF.x() / img.width(),
+                                              imgF.y() / img.height());
+                emit cropEditStarted();
+                event->accept();
+                return;
+            }
+        }
         event->accept();
         return;
     }
@@ -506,6 +632,23 @@ void PreviewWidget::mouseMoveEvent(QMouseEvent* event)
         return;
     }
 
+    if (m_cropDragHandle != CropHandle::None) {
+        applyCropDrag(event->position());
+        update();
+        emit cropRectChanged(m_cropRect);
+        event->accept();
+        return;
+    }
+
+    if (activeMaskIsBrush()) {
+        updateBrushCursor(event->position());
+        if (m_brushPainting) {
+            appendBrushPoint(event->position());
+            event->accept();
+            return;
+        }
+    }
+
     // Handle drag in progress.
     if (m_grabbedHandle >= 0 && m_activeMask) {
         applyHandleDrag(m_grabbedHandle, event->position());
@@ -528,6 +671,18 @@ void PreviewWidget::mouseReleaseEvent(QMouseEvent* event)
         event->accept();
         return;
     }
+    if (m_cropDragHandle != CropHandle::None && event->button() == Qt::LeftButton) {
+        m_cropDragHandle = CropHandle::None;
+        event->accept();
+        return;
+    }
+    if (m_brushPainting && event->button() == Qt::LeftButton) {
+        appendBrushPoint(event->position());
+        m_brushPainting = false;
+        m_activeBrushStrokeIndex = -1;
+        event->accept();
+        return;
+    }
     if (m_grabbedHandle >= 0 && event->button() == Qt::LeftButton) {
         m_grabbedHandle = -1;
         event->accept();
@@ -541,6 +696,10 @@ void PreviewWidget::mouseReleaseEvent(QMouseEvent* event)
 // ==============================================================================
 void PreviewWidget::mouseDoubleClickEvent(QMouseEvent* event)
 {
+    if (m_cropOverlayActive) {
+        event->accept();
+        return;
+    }
     if (event->button() != Qt::LeftButton || !hasImage()) {
         QWidget::mouseDoubleClickEvent(event);
         return;
@@ -561,6 +720,236 @@ void PreviewWidget::mouseDoubleClickEvent(QMouseEvent* event)
     }
     update();
     event->accept();
+}
+
+void PreviewWidget::keyPressEvent(QKeyEvent* event)
+{
+    if (m_cropOverlayActive) {
+        if (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter) {
+            m_cropOverlayActive = false;
+            m_cropDragHandle = CropHandle::None;
+            update();
+            emit cropEditCommitted();
+            event->accept();
+            return;
+        }
+        if (event->key() == Qt::Key_Escape) {
+            m_cropRect = normalizedCropRect(m_cropRectAtToolStart);
+            m_cropOverlayActive = false;
+            m_cropDragHandle = CropHandle::None;
+            update();
+            emit cropRectChanged(m_cropRect);
+            emit cropEditCanceled(m_cropRect);
+            event->accept();
+            return;
+        }
+    }
+
+    QWidget::keyPressEvent(event);
+}
+
+void PreviewWidget::leaveEvent(QEvent* event)
+{
+    if (m_brushCursorVisible) {
+        m_brushCursorVisible = false;
+        update();
+    }
+    QWidget::leaveEvent(event);
+}
+
+QRectF PreviewWidget::normalizedCropRect(const QRectF& rect)
+{
+    QRectF r = rect.normalized();
+    double x = std::clamp(r.x(), 0.0, 1.0 - kCropMinSize);
+    double y = std::clamp(r.y(), 0.0, 1.0 - kCropMinSize);
+    double w = std::clamp(r.width(),  kCropMinSize, 1.0 - x);
+    double h = std::clamp(r.height(), kCropMinSize, 1.0 - y);
+    return QRectF(x, y, w, h);
+}
+
+QRectF PreviewWidget::cropRectInWidget() const
+{
+    const QImage& img = displayImage();
+    if (img.isNull()) return QRectF();
+
+    const QRectF r = normalizedCropRect(m_cropRect);
+    const QPointF tl = imageToWidget(QPointF(r.left() * img.width(),
+                                             r.top() * img.height()));
+    const QPointF br = imageToWidget(QPointF(r.right() * img.width(),
+                                             r.bottom() * img.height()));
+    return QRectF(tl, br).normalized();
+}
+
+PreviewWidget::CropHandle PreviewWidget::hitTestCropHandle(const QPointF& widgetPos) const
+{
+    const QRectF r = cropRectInWidget();
+    if (r.isEmpty()) return CropHandle::None;
+
+    auto nearPoint = [&](const QPointF& p) {
+        return std::hypot(widgetPos.x() - p.x(), widgetPos.y() - p.y())
+            <= kCropHandleHitRadius;
+    };
+    auto nearSegment = [&](const QLineF& line) {
+        const QRectF bounds = QRectF(line.p1(), line.p2()).normalized()
+            .adjusted(-kCropHandleHitRadius, -kCropHandleHitRadius,
+                       kCropHandleHitRadius,  kCropHandleHitRadius);
+        return bounds.contains(widgetPos);
+    };
+
+    const QPointF tl = r.topLeft();
+    const QPointF tr = r.topRight();
+    const QPointF br = r.bottomRight();
+    const QPointF bl = r.bottomLeft();
+
+    if (nearPoint(tl)) return CropHandle::TopLeft;
+    if (nearPoint(tr)) return CropHandle::TopRight;
+    if (nearPoint(br)) return CropHandle::BottomRight;
+    if (nearPoint(bl)) return CropHandle::BottomLeft;
+    if (nearSegment(QLineF(tl, tr))) return CropHandle::Top;
+    if (nearSegment(QLineF(tr, br))) return CropHandle::Right;
+    if (nearSegment(QLineF(bl, br))) return CropHandle::Bottom;
+    if (nearSegment(QLineF(tl, bl))) return CropHandle::Left;
+    if (r.contains(widgetPos)) return CropHandle::Move;
+    return CropHandle::None;
+}
+
+void PreviewWidget::applyCropDrag(const QPointF& widgetPos)
+{
+    const QImage& img = displayImage();
+    if (img.isNull() || img.width() <= 0 || img.height() <= 0) return;
+
+    const QPointF imgPx = widgetToImage(widgetPos);
+    const QPointF norm(
+        std::clamp(imgPx.x() / img.width(),  0.0, 1.0),
+        std::clamp(imgPx.y() / img.height(), 0.0, 1.0));
+
+    QRectF r = m_cropDragStartRect;
+    if (m_cropDragHandle == CropHandle::Move) {
+        const QPointF delta = norm - m_cropDragStartNorm;
+        r.translate(delta);
+        if (r.left() < 0.0) r.moveLeft(0.0);
+        if (r.top() < 0.0) r.moveTop(0.0);
+        if (r.right() > 1.0) r.moveRight(1.0);
+        if (r.bottom() > 1.0) r.moveBottom(1.0);
+        m_cropRect = normalizedCropRect(r);
+        return;
+    }
+
+    double left = r.left();
+    double right = r.right();
+    double top = r.top();
+    double bottom = r.bottom();
+
+    const bool editLeft =
+        m_cropDragHandle == CropHandle::TopLeft ||
+        m_cropDragHandle == CropHandle::BottomLeft ||
+        m_cropDragHandle == CropHandle::Left;
+    const bool editRight =
+        m_cropDragHandle == CropHandle::TopRight ||
+        m_cropDragHandle == CropHandle::BottomRight ||
+        m_cropDragHandle == CropHandle::Right;
+    const bool editTop =
+        m_cropDragHandle == CropHandle::TopLeft ||
+        m_cropDragHandle == CropHandle::TopRight ||
+        m_cropDragHandle == CropHandle::Top;
+    const bool editBottom =
+        m_cropDragHandle == CropHandle::BottomLeft ||
+        m_cropDragHandle == CropHandle::BottomRight ||
+        m_cropDragHandle == CropHandle::Bottom;
+
+    if (editLeft) left = std::min(norm.x(), right - kCropMinSize);
+    if (editRight) right = std::max(norm.x(), left + kCropMinSize);
+    if (editTop) top = std::min(norm.y(), bottom - kCropMinSize);
+    if (editBottom) bottom = std::max(norm.y(), top + kCropMinSize);
+
+    r = normalizedCropRect(QRectF(QPointF(left, top), QPointF(right, bottom)));
+
+    if (m_cropAspectLocked && m_cropAspectRatio > 0.0) {
+        const double normalizedRatio =
+            m_cropAspectRatio * static_cast<double>(img.height()) /
+            static_cast<double>(img.width());
+
+        const bool corner = (editLeft || editRight) && (editTop || editBottom);
+        const QPointF anchor(
+            editLeft ? m_cropDragStartRect.right() :
+            editRight ? m_cropDragStartRect.left() : m_cropDragStartRect.center().x(),
+            editTop ? m_cropDragStartRect.bottom() :
+            editBottom ? m_cropDragStartRect.top() : m_cropDragStartRect.center().y());
+
+        if (corner) {
+            double w = std::fabs(norm.x() - anchor.x());
+            double h = std::fabs(norm.y() - anchor.y());
+            if (h <= 1e-6 || w / h > normalizedRatio) {
+                h = w / normalizedRatio;
+            } else {
+                w = h * normalizedRatio;
+            }
+            const double sx = editLeft ? -1.0 : 1.0;
+            const double sy = editTop ? -1.0 : 1.0;
+            r = QRectF(anchor, QPointF(anchor.x() + sx * w,
+                                       anchor.y() + sy * h)).normalized();
+        } else if (editLeft || editRight) {
+            double w = r.width();
+            double h = w / normalizedRatio;
+            const double cy = m_cropDragStartRect.center().y();
+            r.setTop(cy - h * 0.5);
+            r.setBottom(cy + h * 0.5);
+        } else if (editTop || editBottom) {
+            double h = r.height();
+            double w = h * normalizedRatio;
+            const double cx = m_cropDragStartRect.center().x();
+            r.setLeft(cx - w * 0.5);
+            r.setRight(cx + w * 0.5);
+        }
+    }
+
+    m_cropRect = normalizedCropRect(r);
+}
+
+void PreviewWidget::paintCropOverlay(QPainter& p)
+{
+    const QRectF imageRect = imageRectInWidget();
+    const QRectF crop = cropRectInWidget();
+    if (imageRect.isEmpty() || crop.isEmpty()) return;
+
+    p.save();
+    p.setRenderHint(QPainter::Antialiasing, true);
+
+    const QColor dim(0, 0, 0, 135);
+    p.fillRect(QRectF(imageRect.left(), imageRect.top(),
+                      imageRect.width(), crop.top() - imageRect.top()), dim);
+    p.fillRect(QRectF(imageRect.left(), crop.bottom(),
+                      imageRect.width(), imageRect.bottom() - crop.bottom()), dim);
+    p.fillRect(QRectF(imageRect.left(), crop.top(),
+                      crop.left() - imageRect.left(), crop.height()), dim);
+    p.fillRect(QRectF(crop.right(), crop.top(),
+                      imageRect.right() - crop.right(), crop.height()), dim);
+
+    QPen gridPen(QColor(255, 255, 255, 110), 1.0);
+    p.setPen(gridPen);
+    for (int i = 1; i <= 2; ++i) {
+        const double x = crop.left() + crop.width() * i / 3.0;
+        const double y = crop.top() + crop.height() * i / 3.0;
+        p.drawLine(QPointF(x, crop.top()), QPointF(x, crop.bottom()));
+        p.drawLine(QPointF(crop.left(), y), QPointF(crop.right(), y));
+    }
+
+    p.setPen(QPen(QColor(0xCC, 0xFF, 0x00), 2.0));
+    p.setBrush(Qt::NoBrush);
+    p.drawRect(crop);
+
+    const QPointF handles[] = {
+        crop.topLeft(), QPointF(crop.center().x(), crop.top()), crop.topRight(),
+        QPointF(crop.right(), crop.center().y()), crop.bottomRight(),
+        QPointF(crop.center().x(), crop.bottom()), crop.bottomLeft(),
+        QPointF(crop.left(), crop.center().y()),
+    };
+    p.setPen(QPen(QColor(0, 0, 0, 190), 2.0));
+    p.setBrush(QColor(0xCC, 0xFF, 0x00));
+    for (const QPointF& h : handles)
+        p.drawEllipse(h, kCropHandlePaintRadius, kCropHandlePaintRadius);
+
+    p.restore();
 }
 
 // ==============================================================================
@@ -592,6 +981,13 @@ void PreviewWidget::setActiveMask(const lps::LocalAdjustment* mask)
     // rebuild itself early-outs on null images / null masks, so the
     // cost when "nothing meaningful changed" is tiny.
     m_activeMask = mask;
+    m_brushPainting = false;
+    m_activeBrushStrokeIndex = -1;
+    if (!activeMaskIsBrush()) {
+        m_brushCursorVisible = false;
+        if (!m_colorSamplingActive && m_panButton == Qt::NoButton)
+            unsetCursor();
+    }
     invalidateMaskOverlayCache();
     update();
 }
@@ -623,6 +1019,151 @@ void PreviewWidget::setMaskViewMode(MaskViewMode mode)
     if (m_maskViewMode == mode) return;
     m_maskViewMode = mode;
     update();
+}
+
+void PreviewWidget::setCropOverlayActive(bool on)
+{
+    if (m_cropOverlayActive == on) return;
+    m_cropOverlayActive = on;
+    m_cropDragHandle = CropHandle::None;
+    if (on) {
+        m_brushPainting = false;
+        m_brushCursorVisible = false;
+        if (!m_colorSamplingActive && m_panButton == Qt::NoButton)
+            unsetCursor();
+        m_cropRectAtToolStart = m_cropRect;
+        setFocus(Qt::MouseFocusReason);
+    }
+    update();
+}
+
+void PreviewWidget::setCropRect(const QRectF& cropRect)
+{
+    const QRectF normalized = normalizedCropRect(cropRect);
+    if (m_cropRect == normalized) return;
+    m_cropRect = normalized;
+    update();
+}
+
+void PreviewWidget::setCropAspectRatio(double ratio)
+{
+    if (!std::isfinite(ratio) || ratio <= 0.0)
+        ratio = 0.0;
+    if (std::fabs(m_cropAspectRatio - ratio) < 1e-4) return;
+    m_cropAspectRatio = ratio;
+}
+
+void PreviewWidget::setCropAspectRatioLocked(bool locked)
+{
+    m_cropAspectLocked = locked;
+}
+
+bool PreviewWidget::activeMaskIsBrush() const
+{
+    return m_activeMask && m_activeMask->type == lps::MaskType::Brush;
+}
+
+bool PreviewWidget::widgetPosToImageNorm(const QPointF& widgetPos, QPointF& norm) const
+{
+    const QImage& img = displayImage();
+    if (img.isNull() || img.width() <= 0 || img.height() <= 0) return false;
+    const QPointF imgPx = widgetToImage(widgetPos);
+    if (imgPx.x() < 0.0 || imgPx.y() < 0.0 ||
+        imgPx.x() > img.width() || imgPx.y() > img.height()) {
+        return false;
+    }
+    norm = QPointF(std::clamp(imgPx.x() / img.width(),  0.0, 1.0),
+                   std::clamp(imgPx.y() / img.height(), 0.0, 1.0));
+    return true;
+}
+
+void PreviewWidget::updateBrushCursor(const QPointF& widgetPos)
+{
+    if (!activeMaskIsBrush()) return;
+    QPointF norm;
+    const bool visible = widgetPosToImageNorm(widgetPos, norm);
+    m_brushCursorVisible = visible;
+    m_brushCursorWidgetPos = widgetPos;
+    if (visible) setCursor(Qt::BlankCursor);
+    else if (!m_colorSamplingActive && m_panButton == Qt::NoButton) unsetCursor();
+    update();
+}
+
+double PreviewWidget::brushRadiusInWidget(const lps::LocalAdjustment& mask) const
+{
+    const QImage& img = displayImage();
+    if (img.isNull()) return 0.0;
+    const double shortEdge = std::min(img.width(), img.height());
+    return std::max(1.0, static_cast<double>(mask.brushSize) * shortEdge
+                         * effectiveScale() * 0.5);
+}
+
+void PreviewWidget::beginBrushStroke(const QPointF& widgetPos, bool erase)
+{
+    if (!activeMaskIsBrush()) return;
+
+    QPointF norm;
+    if (!widgetPosToImageNorm(widgetPos, norm)) return;
+
+    auto* mask = const_cast<lps::LocalAdjustment*>(m_activeMask);
+    lps::BrushStroke stroke;
+    stroke.size    = std::clamp(mask->brushSize, 0.001f, 1.0f);
+    stroke.feather = std::clamp(mask->feather, 0.0f, 1.0f);
+    stroke.flow    = std::clamp(mask->flow, 0.0f, 1.0f);
+    stroke.density = std::clamp(mask->density, 0.0f, 1.0f);
+    stroke.erase   = erase || mask->brushEraseMode;
+    stroke.points.append(norm);
+    mask->brushStrokes.append(stroke);
+    m_activeBrushStrokeIndex = static_cast<int>(mask->brushStrokes.size()) - 1;
+    m_lastBrushPointNorm = norm;
+    m_brushPainting = true;
+    updateBrushCursor(widgetPos);
+    invalidateMaskOverlayCache();
+    update();
+}
+
+void PreviewWidget::appendBrushPoint(const QPointF& widgetPos)
+{
+    if (!activeMaskIsBrush() || !m_brushPainting) return;
+
+    QPointF norm;
+    if (!widgetPosToImageNorm(widgetPos, norm)) {
+        updateBrushCursor(widgetPos);
+        return;
+    }
+
+    auto* mask = const_cast<lps::LocalAdjustment*>(m_activeMask);
+    const int strokeCount = static_cast<int>(mask->brushStrokes.size());
+    if (m_activeBrushStrokeIndex < 0 ||
+        m_activeBrushStrokeIndex >= strokeCount) {
+        return;
+    }
+
+    lps::BrushStroke& stroke = mask->brushStrokes[m_activeBrushStrokeIndex];
+    const QImage& img = displayImage();
+    const float aspect = img.height() > 0
+        ? static_cast<float>(img.width()) / static_cast<float>(img.height())
+        : 1.0f;
+    const float spacing = std::max(0.001f, stroke.size * 0.18f);
+    const float dist = lps::brushDistanceShortEdge(m_lastBrushPointNorm,
+                                                   norm, aspect);
+    if (dist < spacing) {
+        updateBrushCursor(widgetPos);
+        return;
+    }
+
+    const int steps = std::max(1, static_cast<int>(std::floor(dist / spacing)));
+    for (int i = 1; i <= steps; ++i) {
+        const double t = static_cast<double>(i) / static_cast<double>(steps);
+        const QPointF p = m_lastBrushPointNorm
+            + (norm - m_lastBrushPointNorm) * t;
+        stroke.points.append(p);
+    }
+    m_lastBrushPointNorm = norm;
+    updateBrushCursor(widgetPos);
+    invalidateMaskOverlayCache();
+    update();
+    emit maskGeometryChanged();
 }
 
 void PreviewWidget::invalidateMaskOverlayCache()
@@ -659,7 +1200,9 @@ void PreviewWidget::rebuildMaskOverlayCache()
     const double invH = 1.0 / static_cast<double>(H);
 
     const lps::LocalAdjustment& mask = *m_activeMask;
-    const float density = std::clamp(mask.density, 0.0f, 1.0f);
+    const float density = (mask.type == lps::MaskType::Brush)
+        ? 1.0f
+        : std::clamp(mask.density, 0.0f, 1.0f);
     const bool  invert  = mask.invert;
     const bool  bw      = (m_maskViewMode == MaskViewMode::BlackAndWhite);
 
@@ -818,12 +1361,22 @@ void PreviewWidget::paintMaskHandles(QPainter& p)
         break;
     }
     case lps::MaskType::Brush: {
-        // V1 placeholder: a small circle indicator at the brush "anchor"
-        // (center if no stamps). Brush painting itself isn't implemented.
-        const QPointF c = imageToWidget(normToImagePx(QPointF(0.5, 0.5), img));
-        p.setPen(QPen(QColor(255, 255, 255, 180), 1.5, Qt::DashLine));
+        if (m_cropOverlayActive || !m_brushCursorVisible) break;
+        const double r = brushRadiusInWidget(mask);
+        const double inner = r * std::max(0.0,
+            static_cast<double>(1.0f - std::clamp(mask.feather, 0.0f, 1.0f)));
+        const QColor brushColor = mask.brushEraseMode
+            ? QColor(255, 120, 120, 230)
+            : QColor(255, 255, 255, 230);
+        p.setPen(QPen(QColor(0, 0, 0, 180), 3.0));
         p.setBrush(Qt::NoBrush);
-        p.drawEllipse(c, 24.0, 24.0);
+        p.drawEllipse(m_brushCursorWidgetPos, r, r);
+        p.setPen(QPen(brushColor, 1.5, Qt::SolidLine));
+        p.drawEllipse(m_brushCursorWidgetPos, r, r);
+        if (inner > 1.0 && inner < r - 1.0) {
+            p.setPen(QPen(brushColor, 1.0, Qt::DashLine));
+            p.drawEllipse(m_brushCursorWidgetPos, inner, inner);
+        }
         break;
     }
     }

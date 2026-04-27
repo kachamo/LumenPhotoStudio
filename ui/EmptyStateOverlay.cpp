@@ -34,6 +34,14 @@ const QStringList& supportedExts()
         QStringLiteral("tif"),
         QStringLiteral("tiff"),
         QStringLiteral("webp"),
+        QStringLiteral("cr2"),
+        QStringLiteral("cr3"),
+        QStringLiteral("nef"),
+        QStringLiteral("arw"),
+        QStringLiteral("dng"),
+        QStringLiteral("raf"),
+        QStringLiteral("orf"),
+        QStringLiteral("rw2"),
     };
     return exts;
 }
@@ -98,7 +106,7 @@ bool EmptyStateOverlay::eventFilter(QObject* watched, QEvent* event)
 //   - 8 px gap
 //   - "or click to open"
 //   - 12 px gap
-//   - "JPG · PNG · TIFF · WEBP"
+//   - "JPG · PNG · TIFF · WEBP · RAW"
 //
 // Drag-hover state adds a subtle dashed accent border so users get visible
 // feedback when their drag is being accepted.
@@ -177,7 +185,7 @@ void EmptyStateOverlay::paintEvent(QPaintEvent* /*event*/)
     p.setFont(formatsFont);
     p.drawText(QRect(0, y, W, formatsH),
                Qt::AlignHCenter | Qt::AlignVCenter,
-               tr("JPG  ·  PNG  ·  TIFF  ·  WEBP"));
+               tr("JPG  ·  PNG  ·  TIFF  ·  WEBP  ·  RAW"));
 }
 
 // ==============================================================================

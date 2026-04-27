@@ -21,21 +21,33 @@
 #include "core/Look.h"
 #include "local/LocalAdjustmentEngine.h"
 
+#include <QDateTime>
 #include <QImage>
 #include <QMainWindow>
 #include <QVBoxLayout>
 
+#include <memory>
+#include <vector>
+
 QT_BEGIN_NAMESPACE
 class QAction;
 class QCheckBox;
+class QDragEnterEvent;
+class QDockWidget;
+class QDropEvent;
 class QLabel;
 class QLineEdit;
 class QListWidget;
 class QListWidgetItem;
 class QMenu;
+class QObject;
 class QPushButton;
+class QScrollArea;
 class QSlider;
 class QStackedLayout;
+class QStackedWidget;
+class QTabBar;
+class QTabWidget;
 class QTimer;
 class QToolButton;
 class QWidget;
@@ -46,8 +58,17 @@ class CurveEditorWidget;
 class ColorWheelWidget;
 class HistogramWidget;
 class EmptyStateOverlay;
+class NodeGraphWidget;
 class PreviewWidget;
 class SecondaryViewerWindow;
+class WelcomeScreenWidget;
+
+namespace lps {
+class AutosaveManager;
+struct ProjectDocument;
+class PluginManager;
+class SettingsManager;
+}
 
 class MainWindow : public QMainWindow
 {
@@ -77,6 +98,8 @@ protected:
     // Prompts to save unsaved changes. If the user picks Cancel, the close
     // is blocked via event->ignore().
     void closeEvent(QCloseEvent* event) override;
+    void dragEnterEvent(QDragEnterEvent* event) override;
+    void dropEvent(QDropEvent* event) override;
 
 private slots:
     // Fires after the debounce interval. Snapshots the current Look and
@@ -88,6 +111,17 @@ private:
     // ---- UI construction ----------------------------------------------------
     void buildUi();
     QWidget* buildControlPanel();
+    QWidget* buildAnalysisPanel();
+    void showWelcomeScreen();
+    void showEditorWorkspace();
+    void updateBottomWorkspaceVisibility();
+    void setBottomWorkspaceCollapsed(bool collapsed);
+    void setAnalysisPanelCollapsed(bool collapsed);
+    void handleRailAction(const QString& action);
+    void scrollInspectorTo(QWidget* section);
+    void refreshWelcomeRecentFiles();
+    void updateNavigatorPreview();
+    void updateMetadataPanel();
 
     // Helper: build one labeled slider row. `onChange` is invoked in response
     // to valueChanged signals (with the slider's integer value); each caller
@@ -150,6 +184,29 @@ private:
     PreviewWidget*     m_previewLabel = nullptr;
     EmptyStateOverlay* m_emptyState   = nullptr;
 
+    // ---- Workspace shell ----------------------------------------------------
+    // Professional photo-editor frame: top workspace bar, left icon rail,
+    // centered canvas, right inspector, and bottom dock tabs.
+    QStackedWidget*      m_workspaceStack = nullptr;
+    WelcomeScreenWidget* m_welcomeScreen  = nullptr;
+    QWidget*             m_editorWorkspace = nullptr;
+    QWidget*             m_workspaceBar   = nullptr;
+    QWidget*             m_toolRail       = nullptr;
+    QWidget*             m_analysisPanel  = nullptr;
+    QToolButton*         m_analysisCollapseBtn = nullptr;
+    QScrollArea*         m_analysisScroll = nullptr;
+    bool                 m_analysisPanelCollapsed = false;
+    QTabWidget*          m_bottomPanelTabs = nullptr;
+    QWidget*             m_bottomWorkspaceContainer = nullptr;
+    QToolButton*         m_bottomWorkspaceCollapseBtn = nullptr;
+    QTabBar*            m_documentTabs = nullptr;
+    QListWidget*         m_historyList = nullptr;
+    bool                 m_editorWorkspaceActive = false;
+    bool                 m_bottomWorkspaceEnabled = true;
+    bool                 m_bottomWorkspaceCollapsed = false;
+    bool                 m_syncingBottomWorkspaceVisibility = false;
+    bool                 m_syncingDocumentTabs = false;
+
     // ---- Sidebar (controls panel) collapse ----------------------------------
     // The full controls panel and a narrow icon-strip "collapsed" view both
     // live as siblings inside m_sidebarStack (a QStackedLayout). Switching
@@ -159,7 +216,30 @@ private:
     QStackedLayout* m_sidebarStack = nullptr;
     QWidget*        m_sidebarFull  = nullptr;   // the 320px controls panel
     QWidget*        m_sidebarMini  = nullptr;   // the ~36px collapsed strip
+    QScrollArea*    m_controlScroll = nullptr;
     bool            m_sidebarCollapsed = false;
+
+    QWidget* m_toneSection = nullptr;
+    QWidget* m_colorSection = nullptr;
+    QWidget* m_hslSection = nullptr;
+    QWidget* m_curvesSection = nullptr;
+    QWidget* m_gradingSection = nullptr;
+    QWidget* m_lensSection = nullptr;
+    QWidget* m_detailsSection = nullptr;
+    QWidget* m_transformSection = nullptr;
+    QWidget* m_masksSection = nullptr;
+    QWidget* m_layersSection = nullptr;
+
+    QLabel* m_navigatorPreview = nullptr;
+    QLabel* m_metaFileName = nullptr;
+    QLabel* m_metaDimensions = nullptr;
+    QLabel* m_metaDateTime = nullptr;
+    QLabel* m_metaIso = nullptr;
+    QLabel* m_metaFocalLength = nullptr;
+    QLabel* m_metaAperture = nullptr;
+    QLabel* m_metaShutterSpeed = nullptr;
+    QLabel* m_metaCameraModel = nullptr;
+    QLabel* m_metaLensModel = nullptr;
 
     // Small status readout in the control panel: "Edited" when viewing the
     // processed preview, "Original" while Spacebar is held.
@@ -190,6 +270,7 @@ private:
     QAction* m_actBeforeAfter        = nullptr;
     QAction* m_actShowHistogram      = nullptr;
     QAction* m_actShowControls       = nullptr;   // toggles sidebar collapse
+    QAction* m_actShowBottomWorkspace = nullptr;
     QAction* m_actFullscreen         = nullptr;
     QAction* m_actOpenImage          = nullptr;
     QAction* m_actExportImage        = nullptr;
@@ -219,6 +300,17 @@ private:
     // it lives as an independent top-level window movable to any
     // monitor).
     SecondaryViewerWindow* m_secondaryViewer = nullptr;
+
+    // Node Graph foundation. Lazy-created on first activation from the
+    // Window menu (or future sidebar icon click). Hosted in a QDockWidget
+    // so it can be docked at the bottom or floated to a second monitor.
+    // V1 is visual only — no render hookup.
+    NodeGraphWidget* m_nodeGraph     = nullptr;
+    QDockWidget*     m_nodeGraphDock = nullptr;
+
+    std::unique_ptr<lps::PluginManager> m_pluginManager;
+    std::unique_ptr<lps::SettingsManager> m_settings;
+    std::unique_ptr<lps::AutosaveManager> m_autosaveManager;
 
     QSlider*  m_exposureSlider   = nullptr;
     QSlider*  m_contrastSlider   = nullptr;
@@ -292,6 +384,56 @@ private:
     QSlider* m_shadowLiftSlider       = nullptr; QLabel* m_shadowLiftValue       = nullptr;
     QSlider* m_fadeBlacksSlider       = nullptr; QLabel* m_fadeBlacksValue       = nullptr;
     QSlider* m_colorSeparationSlider  = nullptr; QLabel* m_colorSeparationValue  = nullptr;
+
+    // ---- Lens correction (master + per-control widgets) --------------------
+    // Vignetting is the only V1-active engine; the rest persist as data.
+    // Sliders are disabled in the UI when the master "Enable Lens
+    // Corrections" checkbox is off — same enable-gating pattern as the
+    // LUT controls.
+    QCheckBox* m_lensEnabledCheck    = nullptr;
+    QCheckBox* m_lensRemoveCaCheck   = nullptr;
+    QSlider*   m_lensDistortionSlider = nullptr; QLabel* m_lensDistortionValue = nullptr;
+    QSlider*   m_lensVignettingSlider = nullptr; QLabel* m_lensVignettingValue = nullptr;
+    QSlider*   m_lensPurpleFringeSlider = nullptr; QLabel* m_lensPurpleFringeValue = nullptr;
+    QSlider*   m_lensGreenFringeSlider  = nullptr; QLabel* m_lensGreenFringeValue  = nullptr;
+
+    // Refresh lens widgets from m_look.lens. Called from applyLookToUi
+    // after undo/redo / preset load. Signal-blocked internally.
+    void refreshLensWidgets();
+
+    // ---- Transform (crop / rotate / flip / straighten) --------------------
+    QPushButton* m_transformFlipHorizontalBtn = nullptr;
+    QPushButton* m_transformFlipVerticalBtn   = nullptr;
+    QPushButton* m_cropToolBtn                = nullptr;
+    QComboBox*   m_cropAspectCombo            = nullptr;
+    QCheckBox*   m_cropLockAspectCheck        = nullptr;
+    QSlider*     m_straightenSlider           = nullptr;
+    QLabel*      m_straightenValue            = nullptr;
+
+    void refreshTransformWidgets();
+    void updateCropAspectConstraint();
+
+    // ---- HDR tone mapping -------------------------------------------------
+    QCheckBox* m_hdrEnabledCheck = nullptr;
+    QSlider*   m_hdrExposureBiasSlider = nullptr; QLabel* m_hdrExposureBiasValue = nullptr;
+    QSlider*   m_hdrHighlightCompressionSlider = nullptr; QLabel* m_hdrHighlightCompressionValue = nullptr;
+    QSlider*   m_hdrShoulderStrengthSlider = nullptr; QLabel* m_hdrShoulderStrengthValue = nullptr;
+    QSlider*   m_hdrMidtonePivotSlider = nullptr; QLabel* m_hdrMidtonePivotValue = nullptr;
+    QSlider*   m_hdrSaturationPreserveSlider = nullptr; QLabel* m_hdrSaturationPreserveValue = nullptr;
+
+    void refreshHdrWidgets();
+
+    // ---- Details (sharpening + noise reduction) ---------------------------
+    QSlider* m_sharpeningAmountSlider  = nullptr; QLabel* m_sharpeningAmountValue  = nullptr;
+    QSlider* m_sharpeningRadiusSlider  = nullptr; QLabel* m_sharpeningRadiusValue  = nullptr;
+    QSlider* m_sharpeningDetailSlider  = nullptr; QLabel* m_sharpeningDetailValue  = nullptr;
+    QSlider* m_sharpeningMaskingSlider = nullptr; QLabel* m_sharpeningMaskingValue = nullptr;
+    QSlider* m_luminanceNrSlider       = nullptr; QLabel* m_luminanceNrValue       = nullptr;
+    QSlider* m_luminanceDetailSlider   = nullptr; QLabel* m_luminanceDetailValue   = nullptr;
+    QSlider* m_colorNrSlider           = nullptr; QLabel* m_colorNrValue           = nullptr;
+    QSlider* m_colorDetailSlider       = nullptr; QLabel* m_colorDetailValue       = nullptr;
+
+    void refreshDetailsWidgets();
 
     // Most-recently-loaded preset filename (display only). Updated by
     // onLoadPreset on success; reset to "(no preset loaded)" on Reset Edits
@@ -369,6 +511,9 @@ private:
     QSlider*     m_maskFeatherSlider  = nullptr; QLabel* m_maskFeatherValue = nullptr;
     QSlider*     m_maskDensitySlider  = nullptr; QLabel* m_maskDensityValue = nullptr;
     QSlider*     m_maskFlowSlider     = nullptr; QLabel* m_maskFlowValue    = nullptr;
+    QSlider*     m_maskBrushSizeSlider = nullptr; QLabel* m_maskBrushSizeValue = nullptr;
+    QCheckBox*   m_maskBrushEraseCheck = nullptr;
+    QPushButton* m_maskResetBrushBtn   = nullptr;
     QPushButton* m_maskResetGeoBtn    = nullptr;
 
     // Mask overlay UI controls. Drive PreviewWidget's overlay state.
@@ -391,6 +536,7 @@ private:
     void onMaskItemChanged(QListWidgetItem* item);   // checkbox toggle
     void onMaskGeometryChangedFromPreview();         // from PreviewWidget signal
     void onResetMaskGeometry();                      // reset selected mask's geometry
+    void onResetBrushMask();                         // clear selected brush strokes
 
     // Push the active-mask pointer to PreviewWidget. Called from
     // refreshMaskWidgets so the preview always reflects the selected
@@ -497,6 +643,39 @@ private:
 
     static constexpr size_t kMaxUndoDepth = 100;
 
+    struct HistoryEntry {
+        QString label;
+        lps::Look snapshot;
+    };
+
+    struct ImageDocument {
+        QString imagePath;
+        QString projectPath;
+        QDateTime projectCreatedDate;
+        QDateTime projectModifiedDate;
+        QImage originalFullRes;
+        QImage previewSource;
+        QImage processed;
+        lps::Look look;
+        bool dirty = false;
+        std::vector<lps::Look> undoStack;
+        std::vector<lps::Look> redoStack;
+        std::vector<HistoryEntry> historyEntries;
+        int historyCurrentIndex = -1;
+        QString nextHistoryLabel;
+        int selectedMaskIndex = -1;
+        int selectedLayerIndex = -1;
+    };
+
+    std::vector<ImageDocument> m_documents;
+    int  m_activeDocumentIndex = -1;
+    bool m_restoringDocument = false;
+
+    std::vector<HistoryEntry> m_historyEntries;
+    int     m_historyCurrentIndex = -1;
+    bool    m_syncingHistorySelection = false;
+    QString m_nextHistoryLabel;
+
     // True while applyLookToUi is actively pushing values into the UI.
     // Guards pushUndoSnapshot() so side-effects of programmatic widget
     // updates can't fabricate undo entries.
@@ -511,6 +690,11 @@ private:
     // m_isApplyingLookToUi is true. Clears the redo stack (any new edit
     // invalidates the redo chain). Caps the undo stack at kMaxUndoDepth.
     void pushUndoSnapshot();
+    void recordHistoryStep(QString label);
+    void clearHistory(const QString& baselineLabel = QString());
+    void refreshHistoryList();
+    void updateCurrentHistorySnapshot();
+    QString historyLabelForSender(const QObject* senderObj) const;
 
     // Restore the previous Look from the undo stack. Current state moves
     // to the redo stack. Updates the UI and re-renders.
@@ -528,19 +712,21 @@ private:
     void applyLookToUi();
 
     // ---- Project state -------------------------------------------------------
-    // A "project" is an editable .lumen file: a JSON envelope around the
+    // A "project" is an editable .lps file: a JSON envelope around the
     // source image path + the Look JSON LookSerializer already produces.
     // Distinct from "exporting an image" (which writes a baked PNG/JPG/etc.).
     //
     // m_currentImagePath: filesystem path of the loaded source image.
     //   Empty string when no image is loaded.
-    // m_currentProjectPath: filesystem path of the .lumen project this Look
+    // m_currentProjectPath: filesystem path of the .lps project this Look
     //   came from (or was saved to). Empty string for unsaved projects.
     // m_projectDirty: true when m_look has changed since the last save.
     //   Set in the debounce handler (the natural funnel for "user just
     //   edited something") and cleared on Save / Save As / Open Project.
     QString m_currentImagePath;
     QString m_currentProjectPath;
+    QDateTime m_projectCreatedDate;
+    QDateTime m_projectModifiedDate;
     bool    m_projectDirty = false;
 
     // True while we're loading a project from disk. Suppresses the dirty-mark
@@ -577,15 +763,14 @@ private:
     // Open Image, which also reloads the image and clears history).
     void onResetEdits();
 
-    // Image orientation — mutates m_originalFullRes / m_previewSource via
-    // QImage transforms, kicks a render, marks dirty. NOT part of the Look
-    // (which represents non-destructive edits); rotation/flip is treated
-    // as image metadata in the Lightroom sense, applied to the source.
-    // Not currently part of undo history — re-rotate to revert.
+    // Non-destructive image orientation.
+    // Stored in m_look.transform so it round-trips through presets/projects
+    // and participates in undo/redo.
     void onRotateLeft();
     void onRotateRight();
     void onFlipHorizontal();
     void onFlipVertical();
+    void onResetTransform();
 
     // Clipboard Look transfer — JSON via QClipboard. Round-trips through
     // LookSerializer so the format matches preset files.
@@ -608,6 +793,10 @@ private:
     // tracks the controls-panel collapse state; placeholder otherwise.
     void onResetWorkspaceLayout();
     void onSaveWorkspaceLayout();
+
+    // Show / focus the Node Graph dock. Lazy-creates the widget and
+    // dock on first call; subsequent calls just bring it to front.
+    void onShowNodeGraph();
 
     // ---- Plugins-menu actions -----------------------------------------------
     void onPluginManager();
@@ -655,8 +844,28 @@ private:
     // event, Open Project, Open Image (deliberately we DON'T prompt on
     // Open Image; see implementation).
     bool maybePromptUnsavedChanges();
+    bool maybePromptSaveDocument(int index);
+    bool maybePromptAllUnsavedDocuments();
+
+    // Multi-document foundation. Existing editor fields remain the active
+    // working copy; these helpers snapshot/restore that working copy to the
+    // tabbed document list.
+    ImageDocument makeDocumentFromCurrentState() const;
+    ImageDocument* activeDocument();
+    const ImageDocument* activeDocument() const;
+    QString documentTitle(const ImageDocument& document) const;
+    void saveActiveDocumentState();
+    int appendCurrentStateAsDocument();
+    bool setActiveDocumentIndex(int index);
+    bool closeDocumentAt(int index);
+    void updateDocumentTabs();
+    void clearEditorStateForNoDocuments();
 
     // Underlying file I/O. Return true on success.
     bool saveProjectToPath(const QString& path);
     bool loadProjectFromPath(const QString& path);
+    bool recoverAutosaveFromPath(const QString& path);
+    void checkAutosaveRecovery();
+    void scheduleAutosave();
+    lps::ProjectDocument currentProjectDocumentForAutosave() const;
 };

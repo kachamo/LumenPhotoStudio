@@ -161,6 +161,7 @@ void ColorWheelWidget::paintEvent(QPaintEvent* /*event*/)
 {
     QPainter p(this);
     p.setRenderHint(QPainter::Antialiasing, true);
+    p.fillRect(rect(), QColor(0x16, 0x18, 0x1D));
 
     // Background: dark surface tile so the wheel sits on a card-like
     // panel rather than on the raw widget background.
@@ -169,7 +170,9 @@ void ColorWheelWidget::paintEvent(QPaintEvent* /*event*/)
 
     // Outer ring shadow / inset look — subtle.
     p.setPen(Qt::NoPen);
-    p.setBrush(QColor(24, 24, 26));
+    p.setBrush(QColor(204, 255, 0, 26));
+    p.drawEllipse(c, r + 5.0, r + 5.0);
+    p.setBrush(QColor(0x1E, 0x20, 0x26));
     p.drawEllipse(c, r + 3.0, r + 3.0);
 
     // The cached wheel.
@@ -178,7 +181,7 @@ void ColorWheelWidget::paintEvent(QPaintEvent* /*event*/)
     }
 
     // Outer rim line — subtle but defines the boundary clearly.
-    p.setPen(QPen(QColor(0, 0, 0, 120), 1.5));
+    p.setPen(QPen(QColor(0x2A, 0x2D, 0x35), 1.5));
     p.setBrush(Qt::NoBrush);
     p.drawEllipse(c, r, r);
 
@@ -198,8 +201,8 @@ void ColorWheelWidget::paintEvent(QPaintEvent* /*event*/)
     p.drawEllipse(puckPos, puckR, puckR);
 
     // Inner dark dot for contrast against the wheel background.
-    p.setPen(QPen(QColor(20, 20, 22), 1.0));
-    p.setBrush(QColor(255, 255, 255, 200));
+    p.setPen(QPen(QColor(0x0E, 0x0F, 0x12), 1.0));
+    p.setBrush(QColor(230, 235, 240, 220));
     p.drawEllipse(puckPos, puckR * 0.45, puckR * 0.45);
 
     // Optional center crosshair — helps users locate sat=0 visually.
