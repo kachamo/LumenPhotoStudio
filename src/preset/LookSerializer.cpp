@@ -52,6 +52,19 @@ float readFloat(const QJsonObject& obj, const QString& key, float defaultVal)
     return static_cast<float>(d);
 }
 
+// Reads one coordinate of a geometry pair. Mask geometry used to call
+// QJsonValue::toDouble() directly, which skips the finiteness check readFloat()
+// applies to every scalar — a NaN in a hand-edited preset reached
+// LocalAdjustment's points and brush stamps unchallenged. Nothing escaped only
+// because clampRanges() happened to absorb it afterwards, which is one layer of
+// defence on a value that would otherwise poison every masked pixel.
+double readCoord(const QJsonValue& v, double defaultVal)
+{
+    if (!v.isDouble()) return defaultVal;
+    const double d = v.toDouble(defaultVal);
+    return std::isfinite(d) ? d : defaultVal;
+}
+
 QString readString(const QJsonObject& obj, const QString& key)
 {
     const QJsonValue v = obj.value(key);
@@ -665,8 +678,8 @@ bool LookSerializer::fromJson(const QJsonObject& obj, Look& out, QString* errorO
             // the field at its struct-default value.
             auto readPoint = [&](const QString& key, QPointF& out) {
                 const QJsonArray a = readArray(m, key);
-                if (a.size() >= 2) out = QPointF(a[0].toDouble(out.x()),
-                                                  a[1].toDouble(out.y()));
+                if (a.size() >= 2) out = QPointF(readCoord(a[0], out.x()),
+                                                  readCoord(a[1], out.y()));
             };
             readPoint("startPoint", la.startPoint);
             readPoint("endPoint",   la.endPoint);
@@ -699,8 +712,8 @@ bool LookSerializer::fromJson(const QJsonObject& obj, Look& out, QString* errorO
                 for (const QJsonValue& pv : points) {
                     const QJsonArray pa = pv.toArray();
                     if (pa.size() >= 2) {
-                        stroke.points.append(QPointF(pa[0].toDouble(),
-                                                     pa[1].toDouble()));
+                        stroke.points.append(QPointF(readCoord(pa[0], 0.0),
+                                                     readCoord(pa[1], 0.0)));
                     }
                 }
                 if (!stroke.points.isEmpty())
@@ -718,8 +731,8 @@ bool LookSerializer::fromJson(const QJsonObject& obj, Look& out, QString* errorO
                     for (const QJsonValue& sv : stamps) {
                         const QJsonArray pa = sv.toArray();
                         if (pa.size() >= 2) {
-                            stroke.points.append(QPointF(pa[0].toDouble(),
-                                                         pa[1].toDouble()));
+                            stroke.points.append(QPointF(readCoord(pa[0], 0.0),
+                                                         readCoord(pa[1], 0.0)));
                         }
                     }
                     if (!stroke.points.isEmpty())

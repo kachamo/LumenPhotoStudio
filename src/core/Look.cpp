@@ -17,8 +17,29 @@
 
 namespace lps {
 
-using math::clamp;
 using math::nearZero;
+
+namespace {
+
+// Parameter sanitisation, applied once per render by Look::clampRanges().
+//
+// math::clamp() maps a non-finite value to `lo`, which is safe but not neutral:
+// for a symmetric slider such as exposure [-10, +10] a corrupt preset would
+// become a violent edit rather than no edit. Seed with 0 instead — the identity
+// value for every symmetric parameter here — and clamp that into range so the
+// few parameters whose domain excludes 0 (brushSize starts at 0.001) still land
+// somewhere legal.
+//
+// This shadows math::clamp for the whole file on purpose: clampRanges() is the
+// boundary where untrusted preset data enters, and every one of the ~90 clamps
+// below should sanitise. The unshadowed math::clamp stays in the per-pixel
+// loops, where the value has already been sanitised here.
+inline float clamp(float v, float lo, float hi)
+{
+    return std::isfinite(v) ? math::clamp(v, lo, hi) : math::clamp(0.0f, lo, hi);
+}
+
+} // namespace
 
 // ---- HDR --------------------------------------------------------------------
 bool HDRParams::isIdentity() const
@@ -155,8 +176,12 @@ void CurvePoints::clampRanges()
     }
     // Clamp each point to [0,1] x [0,1]; force endpoints.
     for (QPointF& p : points) {
-        p.setX(std::clamp(p.x(), 0.0, 1.0));
-        p.setY(std::clamp(p.y(), 0.0, 1.0));
+        // std::clamp has the same NaN hole as the old math::clamp, and a NaN
+        // coordinate would then be fed to the std::sort below — whose `<`
+        // comparator is not a strict weak ordering over NaN, which is undefined
+        // behaviour, not merely a wrong order.
+        p.setX(std::isfinite(p.x()) ? std::clamp(p.x(), 0.0, 1.0) : 0.0);
+        p.setY(std::isfinite(p.y()) ? std::clamp(p.y(), 0.0, 1.0) : 0.0);
     }
     std::sort(points.begin(), points.end(),
               [](const QPointF& a, const QPointF& b) { return a.x() < b.x(); });

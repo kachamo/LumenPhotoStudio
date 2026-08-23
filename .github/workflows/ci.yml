@@ -212,6 +212,13 @@ jobs:
       # by another change) constructs the main window, pumps the event loop
       # and exits 0 without needing a real display — QT_QPA_PLATFORM=offscreen
       # is what makes that possible with no X server / window compositor.
+      # Unit tests run before the smoke test: a failing assertion names the
+      # thing that broke, whereas a smoke-test failure only says the app died.
+      - name: Run unit tests (ctest)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: ctest --test-dir build --build-config "${BUILD_TYPE}" --output-on-failure
+
       - name: Run smoke test (offscreen)
         id: smoke
         env:
