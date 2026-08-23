@@ -1,0 +1,49 @@
+# Normalize line endings so the repo is contributor-proof.
+#
+# This project is developed on Windows but built and tested on Linux and
+# macOS in CI. Without these rules, a contributor whose core.autocrlf is
+# unset or false commits CRLF, and Linux fails in ways that are painful to
+# diagnose: a shell script with CRLF dies with "bad interpreter: /bin/bash^M",
+# and a .desktop file with CRLF is rejected by desktop-file-validate.
+
+# Default: normalize to LF in the repository for anything Git detects as text.
+* text=auto eol=lf
+
+# Must be LF at runtime on Linux/macOS regardless of platform.
+*.sh            text eol=lf
+*.desktop       text eol=lf
+*.xml           text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.plist         text eol=lf
+*.in            text eol=lf
+
+# Source and docs.
+*.c             text eol=lf
+*.cpp           text eol=lf
+*.h             text eol=lf
+*.hpp           text eol=lf
+*.qrc           text eol=lf
+*.cmake         text eol=lf
+CMakeLists.txt  text eol=lf
+*.md            text eol=lf
+*.txt           text eol=lf
+*.json          text eol=lf
+
+# Windows resource scripts: rc.exe and windres both accept LF.
+*.rc            text eol=lf
+
+# Binary — never touch.
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
+*.ico           binary
+*.icns          binary
+*.zip           binary
+*.ai            binary
+*.cube          binary
+*.dng           binary
+*.cr2           binary
+*.cr3           binary
+*.nef           binary
+*.arw           binary
