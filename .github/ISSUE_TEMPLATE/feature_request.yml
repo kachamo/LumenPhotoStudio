@@ -1,0 +1,56 @@
+name: Feature request
+description: Suggest an idea or enhancement for Lumen Photo Studio.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for the suggestion. Describing the problem first (before the proposed solution) makes it much easier to evaluate alternatives.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: What are you trying to do that the app doesn't support today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you like to see happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Any other approaches or workarounds you've thought about.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area of the app
+      options:
+        - Import / RAW decoding
+        - Tone / color / curves
+        - Local adjustments / masking
+        - Presets / Looks
+        - Export
+        - Plugins
+        - Performance
+        - UI / UX
+        - Build / packaging / CI
+        - Other
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: Mockups, references to similar features in other editors, etc.

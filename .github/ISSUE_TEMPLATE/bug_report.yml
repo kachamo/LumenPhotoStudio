@@ -1,0 +1,125 @@
+name: Bug report
+description: Report a crash, incorrect rendering, or other broken behavior in Lumen Photo Studio.
+title: "[Bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. The OS/Qt/build fields below are usually what let us reproduce the problem, so please fill them in even if they seem obvious.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A clear description of the bug, and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Numbered steps, as minimal as you can make them.
+      placeholder: |
+        1. Open a RAW file
+        2. Apply ...
+        3. ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - Linux
+        - macOS
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: input
+    id: os-version
+    attributes:
+      label: OS version
+      placeholder: e.g. Windows 11 24H2, Ubuntu 24.04, macOS 15.1 Sequoia
+    validations:
+      required: true
+
+  - type: input
+    id: qt-version
+    attributes:
+      label: Qt version
+      description: "Help > About, or the version reported at startup in the log."
+      placeholder: e.g. 6.8.3
+    validations:
+      required: true
+
+  - type: dropdown
+    id: build-type
+    attributes:
+      label: Build type
+      description: How was this build produced?
+      options:
+        - Official release build
+        - Self-built (Release)
+        - Self-built (Debug/RelWithDebInfo)
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: app-version
+    attributes:
+      label: Lumen Photo Studio version / commit
+      placeholder: e.g. 1.1.0, or a commit SHA if built from source
+    validations:
+      required: false
+
+  - type: dropdown
+    id: raw-format
+    attributes:
+      label: RAW file format (if applicable)
+      description: Only relevant if this bug involves opening, importing, or decoding a RAW photo.
+      options:
+        - Not applicable / not a RAW-related bug
+        - CR2 / CR3 (Canon)
+        - NEF (Nikon)
+        - ARW (Sony)
+        - RAF (Fujifilm)
+        - ORF (Olympus / OM System)
+        - RW2 (Panasonic)
+        - DNG (Adobe / generic)
+        - PEF (Pentax)
+        - Other (describe below)
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: libraw
+    attributes:
+      label: LibRaw support
+      description: >-
+        Only relevant for RAW-related bugs. Self-built binaries depend on
+        whether LibRaw was found at CMake configure time (LPS_HAS_LIBRAW);
+        our CI deliberately builds with LibRaw enabled on Linux and disabled
+        on Windows/macOS to cover both code paths.
+      options:
+        - label: This build has LibRaw / RAW support enabled
+        - label: This build does NOT have LibRaw / RAW support enabled
+        - label: Not sure
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output / crash backtrace
+      description: Paste any console output, crash dialog text, or backtrace.
+      render: shell
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: Screenshots, sample files (if shareable), workarounds you've tried, etc.

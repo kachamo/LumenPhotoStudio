@@ -1,0 +1,18 @@
+// ==============================================================================
+// lps_build_info.h  (generated - do not edit)
+//
+// Template: packaging/cmake/lps_build_info.h.in
+// Output:   ${CMAKE_BINARY_DIR}/generated/lps_build_info.h
+//
+// Single source of truth for the strings the application reports to the
+// desktop environment. Every value is configured from CMake so nothing can
+// drift away from project(VERSION) in CMakeLists.txt.
+// ==============================================================================
+#pragma once
+
+#define LPS_APP_NAME_STR      "@LPS_APP_NAME@"
+#define LPS_APP_VERSION_STR   "@LPS_APP_VERSION@"
+#define LPS_COMPANY_NAME_STR  "@LPS_COMPANY_NAME@"
+#define LPS_ORG_DOMAIN_STR    "@LPS_ORG_DOMAIN@"
+#define LPS_DESKTOP_ID_STR    "@LPS_DESKTOP_ID@"
+#define LPS_BUNDLE_ID_STR     "@LPS_BUNDLE_ID@"

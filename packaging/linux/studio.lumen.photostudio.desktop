@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Lumen Photo Studio
+GenericName=Photo Editor
+Comment=Non-destructive RAW and photo editor with a linear-light pipeline
+Exec=LumenPhotoStudio %F
+TryExec=LumenPhotoStudio
+Icon=studio.lumen.photostudio
+Terminal=false
+Categories=Graphics;Photography;RasterGraphics;
+Keywords=photo;photography;raw;develop;editor;colour;color;grading;curves;hdr;
+MimeType=image/jpeg;image/png;image/tiff;image/bmp;image/webp;image/x-canon-cr2;image/x-canon-cr3;image/x-nikon-nef;image/x-sony-arw;image/x-adobe-dng;image/x-fuji-raf;image/x-olympus-orf;image/x-panasonic-rw2;
+StartupNotify=true
+StartupWMClass=LumenPhotoStudio

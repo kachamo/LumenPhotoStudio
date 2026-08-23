@@ -12,3 +12,12 @@ output/
 temp/
 cache/
 logs/
+dist/
+.qtcreator/
+CMakeUserPresets.json
+*.app/
+compile_commands.json
+.cache/
+
+# Tooling artifacts
+.gstack/
