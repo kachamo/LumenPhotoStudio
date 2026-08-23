@@ -4,6 +4,7 @@
 #include "MainWindow.h"
 
 #include "AiPanelWidget.h"
+#include "LibraryView.h"
 #include "ColorWheelWidget.h"
 #include "CurveEditorWidget.h"
 #include "EmptyStateOverlay.h"
@@ -15,6 +16,7 @@
 #include "WelcomeScreenWidget.h"
 
 #include "core/ImagePipeline.h"
+#include "core/PixelBuffer.h"
 #include "io/ImageMetadataReader.h"
 #include "io/RawImageLoader.h"
 #include "plugins/PluginManager.h"
@@ -30,6 +32,7 @@
 #include <QCoreApplication>
 #include <QCloseEvent>
 #include <QColor>
+#include <QColorSpace>
 #include <QDateTime>
 #include <QDesktopServices>
 #include <QDir>
@@ -1018,6 +1021,23 @@ void MainWindow::buildUi()
     root->addWidget(body, /*stretch=*/1);
 
     m_workspaceStack->addWidget(central);
+
+    // ---- Library workspace (stack index 2) ---------------------------------
+    // The catalog half of the application. It owns its own database worker,
+    // so constructing it here costs nothing until the user opens it.
+    m_libraryView = new LibraryView(m_workspaceStack);
+    m_libraryIndex = m_workspaceStack->addWidget(m_libraryView);
+    connect(m_libraryView, &LibraryView::imageActivated,
+            this, [this](const QString& path) {
+        // Hand off to the editor, exactly as an Open would.
+        if (loadImageFromPath(path))
+            showEditorWorkspace();
+    });
+    // LibraryView::statusMessage is deliberately not connected. MainWindow has
+    // no QStatusBar, and calling statusBar() would create one — adding chrome
+    // to every workspace, including the editor. LibraryView already renders
+    // this text in its own status line, so nothing is lost. Connect it here if
+    // a global status bar is ever introduced.
     setCentralWidget(m_workspaceStack);
 
     // ---- Bottom dock panel -------------------------------------------------
@@ -1134,6 +1154,27 @@ void MainWindow::showEditorWorkspace()
     if (m_workspaceStack)
         m_workspaceStack->setCurrentIndex(1);
     updateBottomWorkspaceVisibility();
+}
+
+void MainWindow::showLibraryWorkspace()
+{
+    if (!m_libraryView || m_libraryIndex < 0) return;
+
+    // Open the catalog on first use rather than at startup, so a broken or
+    // missing catalog cannot stop the application from launching. LibraryView
+    // renders its own error state if this fails.
+    static bool catalogOpened = false;
+    if (!catalogOpened) {
+        catalogOpened = true;
+        m_libraryView->openCatalog();
+    }
+
+    // The Library is not the editor: the bottom workspace and its docks
+    // belong to the editing surface only.
+    m_editorWorkspaceActive = false;
+    m_workspaceStack->setCurrentIndex(m_libraryIndex);
+    updateBottomWorkspaceVisibility();
+    m_libraryView->refresh();
 }
 
 MainWindow::ImageDocument MainWindow::makeDocumentFromCurrentState() const
@@ -3337,8 +3378,7 @@ void MainWindow::handleRailAction(const QString& action)
     const QString key = action.toLower();
 
     if (key == QStringLiteral("library")) {
-        QMessageBox::information(this, tr("Library"),
-                                 tr("This feature isn't implemented yet."));
+        showLibraryWorkspace();
     } else if (key == QStringLiteral("histogram")) {
         setAnalysisPanelCollapsed(false);
         if (m_histogramWidget) m_histogramWidget->setVisible(true);
@@ -4341,14 +4381,67 @@ void MainWindow::onExportImage()
     // acceptable for a desktop tool at typical photo sizes; a future step
     // could move this onto the existing QFutureWatcher infrastructure for
     // huge files.
-    lps::ImagePipeline pipeline;
-    const lps::RenderResult r = pipeline.render(m_originalFullRes, m_look);
-    QImage exportImage = r.image;
-    if (exportImage.isNull()) {
-        QMessageBox::warning(this, tr("Export Image"), tr("Render failed."));
+    // ---- Bit depth decided BEFORE rendering ---------------------------------
+    // This ordering is the whole point. ImagePipeline::render() encodes to
+    // 8-bit ARGB32 and destroys the float buffer, so rendering first and
+    // deepening afterwards yields a structurally-16-bit file carrying 8 bits
+    // of tone. Measured on a 4096-step ramp: straight from the float buffer
+    // gives 4096 distinct 16-bit codes, via ARGB32 gives 256.
+    //
+    // Refuse before writing anything if the codec cannot carry the depth.
+    // ExportDialog already forces the control to 8 in that case, so this only
+    // fires for a preset applied programmatically — but a silently 8-bit file
+    // reported as success is exactly the failure this exists to remove.
+    const bool wantsDeepColor = exportOptions.bitDepth == 16;
+    if (wantsDeepColor
+        && !ExportDialog::formatSupports16Bit(exportOptions.imageFormat())) {
+        QMessageBox::warning(
+            this, tr("Export Image"),
+            tr("16-bit was requested, but this build cannot write %1 at "
+               "16 bits per channel. Nothing was written. "
+               "Export as PNG, or choose 8-bit.")
+                .arg(exportOptions.format));
         return;
     }
 
+    // Full-resolution render through the same pipeline. Blocks the UI thread —
+    // acceptable for a desktop tool at typical photo sizes; a future step
+    // could move this onto the existing QFutureWatcher infrastructure for
+    // huge files.
+    lps::ImagePipeline pipeline;
+    QImage exportImage;
+
+    if (wantsDeepColor) {
+        // renderToBuffer() runs the identical engine chain (they share
+        // runEngines()) but hands back the linear float buffer instead of an
+        // encoded image, so the 16-bit transfer table sees full precision.
+        lps::ImagePipeline::BufferResult br =
+            pipeline.renderToBuffer(m_originalFullRes, m_look);
+        if (br.buffer.isNull()) {
+            QMessageBox::warning(this, tr("Export Image"), tr("Render failed."));
+            return;
+        }
+        exportImage = br.buffer.toSrgb16Image();
+        if (exportImage.isNull() || exportImage.depth() != 64) {
+            QMessageBox::warning(
+                this, tr("Export Image"),
+                tr("Could not build the 16-bit image (out of memory?). "
+                   "Nothing was written."));
+            return;
+        }
+    } else {
+        // Unchanged 8-bit path.
+        const lps::RenderResult r = pipeline.render(m_originalFullRes, m_look);
+        exportImage = r.image;
+        if (exportImage.isNull()) {
+            QMessageBox::warning(this, tr("Export Image"), tr("Render failed."));
+            return;
+        }
+    }
+
+    // Resize after encoding. QImage::scaled() preserves the 16-bit formats
+    // (verified for RGBX64/RGBA64 with both smooth and fast transformation),
+    // so depth survives the downscale.
     if (exportOptions.resize) {
         exportImage = exportImage.scaled(
             exportOptions.width,
@@ -4357,6 +4450,34 @@ void MainWindow::onExportImage()
                 ? Qt::KeepAspectRatio
                 : Qt::IgnoreAspectRatio,
             Qt::SmoothTransformation);
+    }
+
+    // ---- Colour management --------------------------------------------------
+    // Convert the pixels, do not merely relabel them.
+    // QImage::convertToColorSpace() is a silent no-op on an untagged image,
+    // so the source has to carry an sRGB tag first — which is what the
+    // pipeline produces and what toSrgb16Image() already sets. The conversion
+    // runs in place; the image is unshared here, so it does not cost a second
+    // full-size allocation. Qt embeds the resulting profile on save, so other
+    // applications read the file correctly.
+    //
+    // 8-bit + sRGB is deliberately left completely untouched — byte for byte
+    // what this function wrote before, including staying untagged. Every
+    // other combination is new behaviour, so tagging costs nothing there.
+    const QColorSpace targetSpace = exportOptions.targetColorSpace();
+    const bool needsConversion =
+        targetSpace.isValid() && targetSpace != QColorSpace(QColorSpace::SRgb);
+    if (needsConversion) {
+        if (!exportImage.colorSpace().isValid())
+            exportImage.setColorSpace(QColorSpace(QColorSpace::SRgb));
+        exportImage.convertToColorSpace(targetSpace);
+        if (exportImage.isNull() || exportImage.colorSpace() != targetSpace) {
+            QMessageBox::warning(
+                this, tr("Export Image"),
+                tr("Could not convert the image to %1. Nothing was written.")
+                    .arg(targetSpace.description()));
+            return;
+        }
     }
 
     if (exportOptions.format == QStringLiteral("JPG") &&

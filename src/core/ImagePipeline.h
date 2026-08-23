@@ -74,6 +74,37 @@ public:
         AfterEffects,
     };
     RenderResult renderUpTo(const QImage& input, Look look, Stage stage) const;
+
+    // Result of renderToBuffer(): the linear-light float buffer itself,
+    // before any encode to an integer image.
+    struct BufferResult
+    {
+        PixelBuffer buffer;
+        bool        wasIdentity = false;
+        double      elapsedMs   = 0.0;
+    };
+
+    // Run the full pipeline and return the LINEAR FLOAT buffer, skipping the
+    // encode that render() performs.
+    //
+    // render() returns 8-bit ARGB32, so anything downstream of it is capped at
+    // 8 bits of tone no matter how deep the output format is. A 16-bit export
+    // that went through render() would be a structurally-16-bit file carrying
+    // 8 bits of information. Export paths must use this instead and encode via
+    // PixelBuffer::toSrgb16Image().
+    //
+    // Measured on a 4096-step ramp: encoding from this buffer yields 4096
+    // distinct 16-bit codes; going via render()'s ARGB32 yields 256.
+    //
+    // The engine chain, its order, and clampRanges() are shared with
+    // renderUpTo() — see runEngines() — so the two can never drift apart.
+    BufferResult renderToBuffer(const QImage& input, Look look) const;
+
+private:
+    // The engine chain, in its fixed order, mutating `buffer` in place and
+    // stopping after `stage`. Single definition shared by renderUpTo() and
+    // renderToBuffer(); do not inline a second copy of this ordering.
+    void runEngines(PixelBuffer& buffer, const Look& look, Stage stage) const;
 };
 
 } // namespace lps

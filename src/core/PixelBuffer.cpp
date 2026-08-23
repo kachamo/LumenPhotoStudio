@@ -11,14 +11,22 @@
 // float buffer without a lossy trip through ARGB32 — a 14-bit sensor
 // truncated to 8 bits has the editing latitude of a JPEG, which defeats the
 // point of the whole float32 pipeline.
+//
+// There are likewise two egress paths, and the same rule applies in reverse.
+// toSrgbImage() is the interactive preview converter and is byte-for-byte
+// the loop it always was. toSrgb16Image() is the export converter; it exists
+// so that everything the float pipeline computed is not thrown away at the
+// last step, which is the mirror image of the ingest problem.
 // ==============================================================================
 #include "core/PixelBuffer.h"
 
 #include "util/ColorSpace.h"
 #include "util/ScanlineParallel.h"
 
+#include <QColorSpace>
 #include <QRgba64>
 
+#include <atomic>
 #include <utility>
 
 namespace lps {
@@ -193,6 +201,94 @@ QImage PixelBuffer::toSrgbImage() const
         }
     });
 
+    return out;
+}
+
+// ---- 16-bit egress (deep colour export) -------------------------------------
+QImage PixelBuffer::toSrgb16Image() const
+{
+    if (isNull()) return {};
+
+    QImage out(m_width, m_height, QImage::Format_RGBA64);
+    if (out.isNull()) return {};   // 8 bytes/pixel — allocation can genuinely fail
+
+    const int width  = m_width;
+    const int height = m_height;
+
+    // Resolve the destination pointer ONCE, outside the parallel region.
+    //
+    // The 8-bit path calls out.scanLine(y) from inside the worker lambda.
+    // That works because the image is unshared, but QImage::scanLine() is the
+    // non-const overload: it calls detach(), which unconditionally bumps a
+    // plain (non-atomic) counter in the image's private data. Calling it from
+    // several threads at once is a data race even when no copy is made. It is
+    // harmless in practice and the preview path is not being touched, but new
+    // code should not repeat it — bits() is called once here, on this thread.
+    uchar* const   base         = out.bits();
+    const qsizetype bytesPerLine = out.bytesPerLine();
+
+    // Set only when a pixel turns out not to be fully opaque. Relaxed is
+    // enough: blockingMap() joins every worker before we read it, and the
+    // only value ever stored is `true`.
+    std::atomic<bool> hasTransparency{false};
+
+    // Same per-scanline parallel structure as every other converter here.
+    QList<int> rows;
+    rows.reserve(height);
+    for (int y = 0; y < height; ++y) rows.append(y);
+
+    QtConcurrent::blockingMap(rows, [&](int y) {
+        const float* srcRow = scanline(y);
+
+        // Channel order: RGBA64 is four native-endian quint16 laid out
+        // [R, G, B, A] at increasing addresses — NOT the [B, G, R, A] byte
+        // order of ARGB32 that toSrgbImage() writes. Writing this buffer with
+        // the 8-bit path's indices would silently swap red and blue, so we go
+        // through qRgba64(), whose component order is R,G,B,A on both byte
+        // orders (Qt flips the shift enum per endianness in qrgba64.h). This
+        // is the exact mirror of what fromSrgb16Image() does on ingest.
+        QRgba64* dstRow = reinterpret_cast<QRgba64*>(
+            base + static_cast<qsizetype>(y) * bytesPerLine);
+
+        bool rowOpaque = true;
+        for (int x = 0; x < width; ++x) {
+            const float* sp = srcRow + x * 4;
+
+            // Alpha: saturating 16-bit clamp, no gamma conversion — alpha is
+            // linear-space-independent. `!(a > 0)` also rejects NaN, matching
+            // the clamp inside linearToSrgb16().
+            const float a = sp[3];
+            const quint16 alpha = !(a > 0.0f) ? quint16(0)
+                                : (a >= 1.0f) ? quint16(65535)
+                                              : static_cast<quint16>(a * 65535.0f + 0.5f);
+            if (alpha != 65535) rowOpaque = false;
+
+            dstRow[x] = qRgba64(colorspace::linearToSrgb16(sp[0]),   // R
+                                colorspace::linearToSrgb16(sp[1]),   // G
+                                colorspace::linearToSrgb16(sp[2]),   // B
+                                alpha);
+        }
+
+        if (!rowOpaque)
+            hasTransparency.store(true, std::memory_order_relaxed);
+    });
+
+    // Fully opaque frames (i.e. every ordinary photograph) become RGBX64.
+    // Identical 64-bit layout, so this only rewrites the format tag — no
+    // second buffer, no second pass. Qt requires the X halfword be 0xffff,
+    // which is exactly what the loop above wrote.
+    //
+    // reinterpretAsFormat() can only fail on a depth mismatch, which is
+    // impossible between two 64-bit formats; if it somehow did, leaving
+    // RGBA64 in place is a correct result rather than a failure, so the
+    // return value is deliberately discarded.
+    if (!hasTransparency.load(std::memory_order_relaxed))
+        (void)out.reinterpretAsFormat(QImage::Format_RGBX64);
+
+    // Tag the encoding. Untagged, QImage::convertToColorSpace() does nothing
+    // at all and the caller would ship sRGB pixels wearing another profile's
+    // name; with the tag, the conversion is real.
+    out.setColorSpace(QColorSpace(QColorSpace::SRgb));
     return out;
 }
 

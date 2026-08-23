@@ -98,7 +98,7 @@ endif()
 
 # Network is required by src/ai/ (bring-your-own-key AI integration). It is the
 # only part of the project that performs network I/O; nothing else links it.
-find_package(Qt6 6.2 REQUIRED COMPONENTS Core Gui Concurrent Widgets Network)
+find_package(Qt6 6.2 REQUIRED COMPONENTS Core Gui Concurrent Widgets Network Sql)
 
 # ==============================================================================
 # Optional LibRaw discovery
@@ -152,6 +152,15 @@ set(LPS_SOURCES
     src/core/ImagePipeline.cpp
     src/core/PixelBuffer.h
     src/core/PixelBuffer.cpp
+
+    # catalog/ (Library module: SQLite catalog, thumbnails, background import)
+    src/catalog/CatalogTypes.h
+    src/catalog/CatalogDatabase.h
+    src/catalog/CatalogDatabase.cpp
+    src/catalog/ThumbnailCache.h
+    src/catalog/ThumbnailCache.cpp
+    src/catalog/CatalogImporter.h
+    src/catalog/CatalogImporter.cpp
 
     # io/
     src/io/ImageMetadataReader.h
@@ -281,6 +290,7 @@ target_link_libraries(lps_engine
         Qt6::Gui
         Qt6::Concurrent
         Qt6::Network
+        Qt6::Sql
 )
 
 if(LPS_HAS_LIBRAW)
@@ -327,6 +337,10 @@ set(LUMEN_UI_SOURCES
     ui/SecondaryViewerWindow.cpp
     ui/AiSettingsDialog.h
     ui/AiSettingsDialog.cpp
+    ui/LibraryView.h
+    ui/LibraryView.cpp
+    ui/CatalogGridView.h
+    ui/CatalogGridView.cpp
     ui/AiPanelWidget.h
     ui/AiPanelWidget.cpp
     resources/resources.qrc
