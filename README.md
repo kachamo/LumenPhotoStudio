@@ -147,6 +147,43 @@ The engine's linear-light color pipeline, module map, and the `Look`/
 color math matters (short version: `pow(2.2)` is wrong and Lumen doesn't
 use it), that's where the detail lives.
 
+## How this was built
+
+Lumen is developed with heavy AI assistance — most commits carry a
+`Co-Authored-By: Claude` trailer, and the git history says so rather than
+hiding it. That seems worth stating plainly up front, along with what it does
+and does not mean here.
+
+What it does **not** mean is unreviewed generated code. The interesting
+question with AI-assisted work is not whether a model wrote a line, it is
+whether anyone checked. The checks in this repository are deliberately the
+kind that fail loudly:
+
+- **CI runs the application, it does not just compile it.** Every platform
+  launches the binary headlessly (`--smoke-test`) and opens the catalog. That
+  distinction is not academic: it caught a use-after-free in the grid's event
+  filter that Windows and Linux silently tolerated and macOS crashed on. A
+  compile-only pipeline would have shipped it.
+- **Performance claims are measured, not asserted.** The 9.5× thumbnail
+  speed-up is a timed A/B; the catalog indexes were chosen by reading
+  `EXPLAIN QUERY PLAN` (a bare `(flag)` index left a temp b-tree sort in the
+  plan and measured 13× slower than the composite that replaced it); the
+  16-bit encoder's error was measured across all 65536 output codes.
+- **The RAW gamma convention was verified against LibRaw's source**, not
+  recalled. `output_bps = 16` does not imply linear output, and getting it
+  wrong produces images that look like a rendering bug rather than a
+  convention mismatch.
+- **Limitations are written down where they are true**, in commit messages,
+  pull requests and code comments — including the uncomfortable ones. See
+  [Current status](#current-status) for what is disabled and why.
+
+The honest caveat: none of the above substitutes for use. **No photograph has
+been edited in anger yet** — no real RAW file has been decoded through the
+16-bit path, and no real library has been imported. CI proves the code builds
+and runs. It proves nothing about whether the pictures look right. If you try
+it on your own files and something is wrong, that is exactly the bug report
+this project needs most.
+
 ## License
 
 [GNU General Public License v3.0](LICENSE) — the same license used by
