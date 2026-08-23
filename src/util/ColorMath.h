@@ -15,9 +15,19 @@
 namespace lps::math {
 
 // ---- Safe clamp (typed, inline, branch-free on modern compilers) ------------
+//
+// Written as `v >= lo` / `v <= hi` rather than `v < lo` / `v > hi` so that NaN
+// lands on `lo` instead of passing straight through. Both comparisons are false
+// for NaN, so the negated form returned it unchanged — and because this is the
+// clamp every per-pixel loop uses, a single NaN parameter propagated through an
+// entire frame. It also made toByte()'s cast undefined behaviour (see below).
+//
+// The two forms compile to the same instruction count; NaN safety here is free,
+// which is why it belongs in the hot path rather than in a separate checked
+// variant that callers would have to remember to use.
 inline float clamp(float v, float lo, float hi)
 {
-    return (v < lo) ? lo : (v > hi) ? hi : v;
+    return (v >= lo) ? ((v <= hi) ? v : hi) : lo;
 }
 
 inline float clamp01(float v)
@@ -28,9 +38,10 @@ inline float clamp01(float v)
 // ---- 8-bit conversion (saturating) ------------------------------------------
 inline unsigned char toByte(float v)
 {
-    // Round-to-nearest with saturation. Avoids undefined behavior on NaN by
-    // relying on the clamp01 path below — NaN compares false in any relation
-    // so clamp01 promotes it to 0.
+    // Round-to-nearest with saturation. clamp01() maps NaN to 0, so the cast
+    // below always has a value in range. That was previously only asserted and
+    // not true: the old clamp returned NaN unchanged, making this cast
+    // undefined behaviour. clamp() now guarantees it.
     const float c = clamp01(v);
     return static_cast<unsigned char>(c * 255.0f + 0.5f);
 }

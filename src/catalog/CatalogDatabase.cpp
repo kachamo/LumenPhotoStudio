@@ -85,9 +85,22 @@ QString normalizeFolderPath(const QString& path)
     if (path.isEmpty())
         return QString();
 
-    const QDir dir(QDir::fromNativeSeparators(path));
-    // canonicalPath() resolves symlinks and "..", but returns empty for a
-    // folder that does not exist, so fall back to the merely cleaned form.
+    // Clean lexically FIRST, then canonicalise.
+    //
+    // canonicalPath() returns empty if any component does not exist, so a path
+    // like "<root>/nested/.." with no "nested" directory silently fell through
+    // to the un-canonicalised branch. On macOS that is not cosmetic: the temp
+    // and home trees live under /var, which is a symlink to /private/var, so
+    // "<root>" canonicalised to /private/var/... while "<root>/nested/.."
+    // cleaned to /var/... . Two different strings for one folder, and therefore
+    // two rows in `folders` for the same directory. Linux and Windows have no
+    // equivalent symlink, so the bug was invisible there.
+    //
+    // Resolving ".." lexically before touching the filesystem is not identical
+    // to resolving it after (it differs if a component is a symlink), but it is
+    // consistent, and canonicalPath() below still resolves symlinks in whatever
+    // survives — which is what actually matters for de-duplicating roots.
+    const QDir dir(QDir::cleanPath(QDir::fromNativeSeparators(path)));
     const QString canonical = dir.canonicalPath();
     QString result = canonical.isEmpty() ? QDir::cleanPath(dir.absolutePath()) : canonical;
 

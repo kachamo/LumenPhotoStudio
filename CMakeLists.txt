@@ -503,3 +503,16 @@ if(UNIX AND NOT APPLE)
         DESTINATION "${CMAKE_INSTALL_DATADIR}/metainfo"
     )
 endif()
+
+# ==============================================================================
+# Tests
+#
+# Off by default when Lumen is consumed as a subproject; on when it is the
+# top-level build, so `ctest` works straight after a normal configure.
+# ==============================================================================
+option(LPS_BUILD_TESTS "Build the unit tests" ${PROJECT_IS_TOP_LEVEL})
+
+if(LPS_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
