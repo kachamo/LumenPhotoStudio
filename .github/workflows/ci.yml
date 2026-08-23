@@ -21,17 +21,23 @@ permissions:
   contents: read
 
 env:
-  # Qt 6.11.2 — matches the developer's local Qt exactly, so a green CI run
-  # and a green local build mean the same thing.
+  # Qt 6.8.4 — the LTS point release that satisfies both platform constraints:
   #
-  # Must be >= 6.8.4 or >= 6.9.2: earlier Qt links the AGL framework, which
-  # Apple removed from the macOS 26 (Tahoe) SDK that `macos-latest` now runs.
-  # Building with 6.8.3 fails at link time with "ld: framework 'AGL' not
-  # found". See QTBUG-137687. Do not lower this below 6.9.2.
+  #   macOS: must be >= 6.8.4 (or >= 6.9.2). Earlier Qt links the AGL
+  #     framework, which Apple removed from the macOS 26 (Tahoe) SDK that
+  #     `macos-latest` now runs, failing with "ld: framework 'AGL' not found".
+  #     See QTBUG-137687.
+  #   Windows: aqtinstall 3.3.0 cannot resolve repository metadata for the
+  #     6.11.x multi-arch layout ("Failed to locate XML data for Qt version
+  #     6.11.2") though it resolves the 6.8.x layout fine.
   #
-  # Pinned exactly (not "6.11.*") so a run today and a run in six months
-  # install the same bits.
-  QT_VERSION: "6.11.2"
+  # 6.11.2 was tried and produced green macOS and Ubuntu builds but a red
+  # Windows one, so do not bump to 6.11.x without also bumping aqtinstall.
+  # Do not lower below 6.8.4 or macOS breaks.
+  #
+  # Note this is NOT the developer's local Qt (6.11.2). Pinned exactly (not
+  # "6.8.*") so a run today and a run in six months install the same bits.
+  QT_VERSION: "6.8.4"
   BUILD_TYPE: Release
 
 jobs:
