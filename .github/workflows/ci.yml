@@ -21,11 +21,17 @@ permissions:
   contents: read
 
 env:
-  # Qt 6.8.3: a modern, published Qt 6 LTS-series point release (project's
-  # CMakeLists requires Qt 6.2 minimum; the developer's local Qt is 6.11).
-  # Pinned exactly (not "6.8.*") so a run today and a run in six months
+  # Qt 6.11.2 — matches the developer's local Qt exactly, so a green CI run
+  # and a green local build mean the same thing.
+  #
+  # Must be >= 6.8.4 or >= 6.9.2: earlier Qt links the AGL framework, which
+  # Apple removed from the macOS 26 (Tahoe) SDK that `macos-latest` now runs.
+  # Building with 6.8.3 fails at link time with "ld: framework 'AGL' not
+  # found". See QTBUG-137687. Do not lower this below 6.9.2.
+  #
+  # Pinned exactly (not "6.11.*") so a run today and a run in six months
   # install the same bits.
-  QT_VERSION: "6.8.3"
+  QT_VERSION: "6.11.2"
   BUILD_TYPE: Release
 
 jobs:
