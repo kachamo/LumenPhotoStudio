@@ -96,7 +96,9 @@ else()
     )
 endif()
 
-find_package(Qt6 6.2 REQUIRED COMPONENTS Core Gui Concurrent Widgets)
+# Network is required by src/ai/ (bring-your-own-key AI integration). It is the
+# only part of the project that performs network I/O; nothing else links it.
+find_package(Qt6 6.2 REQUIRED COMPONENTS Core Gui Concurrent Widgets Network)
 
 # ==============================================================================
 # Optional LibRaw discovery
@@ -246,6 +248,13 @@ set(LPS_SOURCES
     src/settings/SettingsManager.h
     src/settings/SettingsManager.cpp
 
+    # ai/ (bring-your-own-API-key integration; AiProvider.h is header-only)
+    src/ai/AiProvider.h
+    src/ai/AiSettings.h
+    src/ai/AiSettings.cpp
+    src/ai/AiClient.h
+    src/ai/AiClient.cpp
+
     # util/ (header-only)
     src/util/ScanlineParallel.h
     src/util/ColorMath.h
@@ -253,6 +262,13 @@ set(LPS_SOURCES
 )
 
 add_library(lps_engine STATIC ${LPS_SOURCES})
+
+# Auto-MOC at the library level. src/ai/AiClient.h declares Q_OBJECT and emits
+# signals, so it needs a generated moc translation unit inside this target;
+# relying on the executable's AUTOMOC would not cover engine headers.
+set_target_properties(lps_engine PROPERTIES
+    AUTOMOC ON
+)
 
 target_include_directories(lps_engine
     PUBLIC
@@ -264,6 +280,7 @@ target_link_libraries(lps_engine
         Qt6::Core
         Qt6::Gui
         Qt6::Concurrent
+        Qt6::Network
 )
 
 if(LPS_HAS_LIBRAW)
@@ -308,6 +325,10 @@ set(LUMEN_UI_SOURCES
     ui/NodeGraphWidget.cpp
     ui/SecondaryViewerWindow.h
     ui/SecondaryViewerWindow.cpp
+    ui/AiSettingsDialog.h
+    ui/AiSettingsDialog.cpp
+    ui/AiPanelWidget.h
+    ui/AiPanelWidget.cpp
     resources/resources.qrc
 )
 
@@ -369,6 +390,7 @@ target_link_libraries(LumenPhotoStudio
         Qt6::Core
         Qt6::Gui
         Qt6::Widgets
+        Qt6::Network
 )
 
 # ------------------------------------------------------------------------------

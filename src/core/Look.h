@@ -350,8 +350,8 @@ struct LensParams
 //                     with smooth falloff controlled by feather
 //   - RadialGradient: weight is 1 inside center+radius*(1-feather), falls
 //                     off smoothly to 0 at center+radius
-//   - Brush:          placeholder — no painting yet, falls through as zero
-//                     weight everywhere (effectively inert)
+//   - Brush:          real — maskWeightBrush() accumulates each stroke's
+//                     stamps, honouring flow, density and erase mode
 //
 // All geometry is stored in NORMALIZED image coordinates ∈ [0, 1] so the
 // same Look applies cleanly regardless of preview vs. full-resolution
@@ -405,14 +405,14 @@ struct LocalAdjustment
     // density — scales the mask's maximum weight, [0, 1]. 1 = full strength
     //           (default), 0 = no effect anywhere. Lightroom convention —
     //           softens the whole mask without changing geometry.
-    // flow    — brush-only painting flow rate placeholder, [0, 1]. V1
-    //           does not paint; the field round-trips for forward-compat.
+    // flow    — brush painting flow rate, [0, 1]. Scales each stamp's
+    //           contribution as strokes accumulate.
     bool     invert     = false;
     float    density    = 1.0f;
     float    flow       = 1.0f;
 
-    // Brush placeholder — stored stamps for forward-compatible serialization.
-    // V1 doesn't paint anything; the engine treats brush masks as zero-weight.
+    // Brush geometry. Strokes are painted in PreviewWidget and evaluated by
+    // maskWeightBrush() in local/MaskGeometry.h.
     float brushSize = 0.08f;              // diameter, fraction of shorter edge
     bool  brushEraseMode = false;
     QVector<BrushStroke> brushStrokes;

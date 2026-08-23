@@ -16,8 +16,9 @@
 //                     softness controlled by feather.
 //   - RadialGradient: weight is 1 inside the inner radius (= radius * (1
 //                     - feather)) and 0 outside `radius`, smooth falloff.
-//   - Brush:          placeholder. V1 treats brush masks as zero-weight
-//                     everywhere — they're inert until the brush UI lands.
+//   - Brush:          real. maskWeightBrush() in MaskGeometry.h accumulates
+//                     each stroke's stamps, honouring flow, density and
+//                     erase mode, and clamps the result to [0, 1].
 // ==============================================================================
 #pragma once
 

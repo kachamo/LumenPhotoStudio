@@ -16,10 +16,12 @@
 // is what every color-managed app uses.
 //
 // Performance: a 256-entry LUT for sRGB->linear is built at static init time
-// (input is 8-bit so this is exact). The reverse direction (linear->sRGB)
-// takes a float in [0,1] so must be computed, not looked up; we amortize
-// the cost via a 4096-entry LUT with linear interpolation — < 0.5 LSB error
-// at 8-bit output.
+// (input is 8-bit so this is exact). A second, 65536-entry LUT covers 16-bit
+// input for the deep-colour ingest path (RAW / 16-bit TIFF / PNG16); it is
+// also exact, and it is built lazily so 8-bit-only sessions never pay for it.
+// The reverse direction (linear->sRGB) takes a float in [0,1] so must be
+// computed, not looked up; we amortize the cost via a 4096-entry LUT with
+// linear interpolation — < 0.5 LSB error at 8-bit output.
 // ==============================================================================
 #pragma once
 
@@ -63,6 +65,61 @@ inline const std::array<float, 256>& srgb8ToLinearLut()
 inline float srgb8ToLinear(unsigned char v)
 {
     return srgb8ToLinearLut()[v];
+}
+
+// ---- 16-bit to linear LUT (exact, 65536 entries) ----------------------------
+// This is the deep-colour ingest path: RAW output at output_bps=16, 16-bit
+// TIFF/PNG, anything QImage reports as Format_RGBX64 / Format_RGBA64 /
+// Format_RGBA64_Premultiplied / Format_Grayscale16.
+//
+// Why a full table rather than calling the transfer function per sample:
+//
+//   1. Exactness. The input domain is a 16-bit integer, so a table with one
+//      entry per code value is EXACT — no interpolation error at all. That is
+//      the same guarantee the 8-bit table gives, and the reason neither of
+//      them needs the interpolation the linear->sRGB table needs.
+//
+//   2. Speed. std::pow() costs on the order of 100 cycles. A 45 MP frame is
+//      ~135 million channel conversions; computing the transfer function
+//      inline would add seconds of wall time to every image open, on the one
+//      code path whose whole purpose is to make large files usable. A table
+//      lookup is a single load.
+//
+//   3. Cost is bounded and small. 65536 * sizeof(float) = 256 KB, once, for
+//      the life of the process. For scale: one 45 MP RGBA64 frame is ~360 MB,
+//      so the table is under 0.1% of the data it serves, and it fits
+//      comfortably in L2 on any machine that can open such a file.
+//
+//   4. It is lazy. Function-local static => constructed on first use (and
+//      thread-safe since C++11, which matters because the ingest loop is
+//      parallel). A session that only ever opens JPEGs allocates nothing and
+//      runs no pow() calls here.
+struct Srgb16ToLinearLut
+{
+    static constexpr int kSize = 65536;
+    std::array<float, kSize> table{};
+    Srgb16ToLinearLut()
+    {
+        for (int i = 0; i < kSize; ++i)
+            table[static_cast<size_t>(i)] = srgbToLinear(static_cast<float>(i) / 65535.0f);
+    }
+};
+
+inline const std::array<float, Srgb16ToLinearLut::kSize>& srgb16ToLinearLut()
+{
+    static const Srgb16ToLinearLut lut;
+    return lut.table;
+}
+
+// Convert a 16-bit sRGB channel value to a linear float in [0,1].
+// EXACT (no interpolation) — the input domain is integer.
+//
+// Callers in a hot loop should hoist srgb16ToLinearLut() out of the loop and
+// index the array directly, exactly as the 8-bit ingest path does; this
+// wrapper is for one-off conversions.
+inline float srgb16ToLinear(unsigned short v)
+{
+    return srgb16ToLinearLut()[v];
 }
 
 // ---- Linear float to 8-bit sRGB (LUT + saturating cast) ---------------------
