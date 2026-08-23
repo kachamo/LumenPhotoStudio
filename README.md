@@ -18,14 +18,29 @@ alternative, built in Qt 6 / C++20.
 
 ## Screenshots
 
-<!-- TODO: add real screenshots before the first tagged release.
-     Suggested shots: main Develop window with an image loaded, the
-     masking/local-adjustments panel, the curve editor, the export dialog.
-     Do not add image links here until the files actually exist in the
-     repo — a 404'd screenshot is worse than no screenshot. -->
+### Develop
 
-*(Screenshots coming before the first release. Build it yourself in the
-meantime — see [Building](#building) below.)*
+Linear-light editing with a live histogram, navigator, EXIF panel, and the full
+tone / colour / HSL / curve stack.
+
+![Lumen Photo Studio — Develop](docs/images/editor.png)
+
+### Library
+
+The SQLite-backed catalog: folder tree, filter bar (rating, flag, colour label,
+free-text search across filename, camera, lens and keywords) and sort.
+
+![Lumen Photo Studio — Library](docs/images/library.png)
+
+### Welcome
+
+![Lumen Photo Studio — Welcome](docs/images/welcome.png)
+
+<sub>Sample photograph from [Pexels](https://www.pexels.com/), used under the
+Pexels licence. Screenshots are generated reproducibly with
+`LumenPhotoStudio --screenshot <dir> --open <image>`, which renders each
+workspace headlessly — no manual cropping, and they can be regenerated after
+any UI change.</sub>
 
 ## What is this?
 
