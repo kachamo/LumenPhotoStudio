@@ -213,12 +213,30 @@ jobs:
       # and exits 0 without needing a real display — QT_QPA_PLATFORM=offscreen
       # is what makes that possible with no X server / window compositor.
       - name: Run smoke test (offscreen)
+        id: smoke
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
           set -euo pipefail
           "${{ steps.locate.outputs.binary }}" --smoke-test
           echo "Smoke test exited 0 on ${{ runner.os }}"
+
+      # TEMPORARY: capture a backtrace when the smoke test crashes on macOS.
+      # A segfault with no stack is not actionable, and the crash is not
+      # reproducible on the Windows dev machine. Remove once diagnosed.
+      - name: Backtrace on macOS smoke-test crash
+        if: ${{ failure() && steps.smoke.outcome == 'failure' && runner.os == 'macOS' }}
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          set +e
+          echo "=== lldb backtrace ==="
+          lldb --batch                -o "run"                -o "thread backtrace all"                -o "quit"                -- "${{ steps.locate.outputs.binary }}" --smoke-test 2>&1 | tail -120
+          echo "=== crash reports ==="
+          ls -t ~/Library/Logs/DiagnosticReports/ 2>/dev/null | head -5
+          for f in $(ls -t ~/Library/Logs/DiagnosticReports/*.ips 2>/dev/null | head -1); do
+            echo "--- $f ---"; head -100 "$f"
+          done
 
       - name: Install to staging prefix
         run: cmake --install build --config "${BUILD_TYPE}" --prefix "${{ github.workspace }}/stage"
