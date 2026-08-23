@@ -224,7 +224,7 @@ jobs:
         run: cmake --install build --config "${BUILD_TYPE}" --prefix "${{ github.workspace }}/stage"
 
       - name: Upload staged build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: LumenPhotoStudio-${{ matrix.os }}
           path: stage/
