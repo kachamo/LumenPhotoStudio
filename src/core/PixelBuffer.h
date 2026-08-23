@@ -38,9 +38,25 @@ class PixelBuffer
 public:
     PixelBuffer() = default;
 
-    // Construct from an sRGB-encoded QImage. Allocates the float buffer,
-    // converts sRGB->linear via the exact 256-entry LUT. Input may be any
-    // format — it's converted to ARGB32 as needed.
+    // Construct from an sRGB-encoded QImage. Allocates the float buffer and
+    // converts sRGB->linear through an exact, integer-indexed LUT.
+    //
+    // Two ingest paths, selected by the source format:
+    //
+    //   16 bits/channel — Format_RGBX64, Format_RGBA64,
+    //       Format_RGBA64_Premultiplied, Format_Grayscale16. Read at full
+    //       depth through the 65536-entry LUT. No down-conversion. This is
+    //       what lets a RAW file keep RAW editing latitude; routing it
+    //       through ARGB32 first would throw away 8 bits per channel before
+    //       the pipeline ever saw the data.
+    //
+    //   everything else — normalized to ARGB32 and read through the
+    //       256-entry LUT. Unchanged from the original implementation.
+    //
+    // Either way the result is float32 linear-light RGBA. Note that the
+    // *input* is expected to be sRGB-ENCODED at whatever depth it carries;
+    // 16-bit does not mean linear here. Producers of 16-bit data (see
+    // io/RawImageLoader) must encode to sRGB before handing an image over.
     static PixelBuffer fromSrgbImage(const QImage& src);
 
     // Convert back to an sRGB-encoded ARGB32 QImage. The internal linear
@@ -64,6 +80,13 @@ public:
     bool isNull() const { return m_pixels.empty(); }
 
 private:
+    // The two ingest paths behind fromSrgbImage(). Split into separate
+    // functions deliberately: the 8-bit path stays byte-for-byte the loop it
+    // always was, with no added per-pixel branch and no added format test
+    // inside the parallel region.
+    static PixelBuffer fromSrgb8Image(const QImage& src);
+    static PixelBuffer fromSrgb16Image(const QImage& src);
+
     std::vector<float> m_pixels;   // size = width * height * 4
     int m_width  = 0;
     int m_height = 0;

@@ -3,6 +3,7 @@
 // ==============================================================================
 #include "MainWindow.h"
 
+#include "AiPanelWidget.h"
 #include "ColorWheelWidget.h"
 #include "CurveEditorWidget.h"
 #include "EmptyStateOverlay.h"
@@ -488,6 +489,61 @@ static const std::array<CurveChannelSpec, 4> kCurveChannels = {{
     { "Blue",   &lps::CurveParams::blue,   "#1f2a3a", QColor(112, 156, 232) },
 }};
 
+// ---- "Engine not landed yet" controls ---------------------------------------
+// A handful of controls in this build have complete UI + serialization +
+// undo/redo but no engine math behind them yet. Rather than let them look
+// live and silently move zero pixels, they are greyed out and say so on
+// hover. Nothing is removed: the underlying lps::Look fields still
+// round-trip through save/load, so projects authored today pick up the
+// real math the moment it lands.
+//
+// Two Qt details drive the shape of the helper below:
+//
+//   1. Qt does not deliver QEvent::ToolTip to a disabled widget. The
+//      request propagates up to the nearest *enabled* ancestor, so the
+//      explanation has to live on a wrapper, not on the dead control.
+//   2. Disabling an ancestor beats any later setEnabled(true) on a
+//      descendant (QWidget::isEnabled() is false while any ancestor is
+//      disabled). Wrapping therefore also makes the disable refresh-proof
+//      against helpers like refreshLensWidgets()/refreshLayerWidgets().
+//
+// Suffix appended to the header of a section whose engine is not wired up.
+// Deliberately plain text — QToolButton/QLabel headers here are not rich
+// text, and a whole badge system would be more weight than this deserves.
+QString inertSuffix()
+{
+    return QCoreApplication::translate("MainWindow", " (coming soon)");
+}
+
+// Standard tooltip body. `what` names the control or group, e.g. "Lift /
+// Gamma / Gain / Offset".
+QString inertTip(const QString& what)
+{
+    return QCoreApplication::translate(
+        "MainWindow",
+        "Not yet implemented — the engine math for %1 is in development, so "
+        "this control does not affect the image yet. Your value is still "
+        "saved with the project and will apply once the engine lands.")
+        .arg(what);
+}
+
+// Disable `inert` and return an enabled wrapper that carries the tooltip.
+// See the note above for why the indirection is needed.
+QWidget* wrapInert(QWidget* inert, const QString& tip, QWidget* parent)
+{
+    inert->setEnabled(false);
+    inert->setToolTip(tip);   // for accessibility tooling, which reads the
+                              // property directly rather than via hover
+
+    auto* wrap = new QWidget(parent);
+    wrap->setToolTip(tip);
+    auto* lay = new QVBoxLayout(wrap);
+    lay->setContentsMargins(0, 0, 0, 0);
+    lay->setSpacing(0);
+    lay->addWidget(inert);
+    return wrap;
+}
+
 } // namespace
 
 // ==============================================================================
@@ -543,6 +599,15 @@ MainWindow::~MainWindow() = default;
 void MainWindow::buildUi()
 {
     setStyleSheet(lumenDarkTheme());
+
+    // Created before buildMenus() because the Window menu adds this dock's
+    // toggleViewAction(); buildMenus() runs first and the pointer must exist.
+    m_aiDock = new QDockWidget(tr("Photo Assistant"), this);
+    m_aiDock->setObjectName(QStringLiteral("aiAssistantDock"));
+    m_aiDock->setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea);
+    m_aiDock->setWidget(new AiPanelWidget(m_aiDock));
+    addDockWidget(Qt::RightDockWidgetArea, m_aiDock);
+    m_aiDock->hide();   // opt-in: the assistant is off until asked for
 
     // Top-level menus (File, Edit, View, Window, Plugins, Help). Built in
     // a dedicated method to keep buildUi() focused on widget layout.
@@ -1959,11 +2024,18 @@ QWidget* MainWindow::buildControlPanel()
         // Lift / Gamma / Gain / Offset. V1 placeholders — UI present, data
         // round-trips, engine math is a follow-up.
         {
+            // Header carries the "(coming soon)" suffix so the state is
+            // visible while the group is still collapsed.
+            const QString advTitle = tr("Advanced Grading") + inertSuffix();
+            const QString advTip   =
+                inertTip(tr("Lift / Gamma / Gain / Offset"));
+
             auto* advHeader = new QToolButton(panel);
-            advHeader->setText(QString::fromUtf8("▸ ") + tr("Advanced Grading"));
+            advHeader->setText(QString::fromUtf8("▸ ") + advTitle);
             advHeader->setToolButtonStyle(Qt::ToolButtonTextOnly);
             advHeader->setAutoRaise(true);
             advHeader->setCursor(Qt::PointingHandCursor);
+            advHeader->setToolTip(advTip);
             advHeader->setStyleSheet(
                 "QToolButton { color: #b0b0b6; text-align: left; padding: 2px 4px; }"
                 "QToolButton:hover { color: #d0d0d4; }");
@@ -1975,26 +2047,41 @@ QWidget* MainWindow::buildControlPanel()
             advLay->setSpacing(2);
             advBox->setVisible(false);   // collapsed by default
 
-            connect(advHeader, &QToolButton::clicked, this, [advHeader, advBox]() {
+            // advBox itself stays enabled: it is the nearest enabled
+            // ancestor of the four dead rows, so it is what actually shows
+            // the tooltip when the user hovers one of them. One tooltip for
+            // the whole group beats four identical ones.
+            advBox->setToolTip(advTip);
+
+            connect(advHeader, &QToolButton::clicked, this,
+                    [advHeader, advBox, advTitle]() {
                 const bool wasVisible = advBox->isVisible();
                 advBox->setVisible(!wasVisible);
                 advHeader->setText((!wasVisible ? QString::fromUtf8("▾ ")
                                                 : QString::fromUtf8("▸ "))
-                                   + tr("Advanced Grading"));
+                                   + advTitle);
             });
 
-            advLay->addWidget(buildSliderRow(tr("Lift"),
-                                             -100, 100, 0,
-                                             m_liftSlider, m_liftValue));
-            advLay->addWidget(buildSliderRow(tr("Gamma"),
-                                             -100, 100, 0,
-                                             m_gammaSlider, m_gammaValue));
-            advLay->addWidget(buildSliderRow(tr("Gain"),
-                                             -100, 100, 0,
-                                             m_gainSlider, m_gainValue));
-            advLay->addWidget(buildSliderRow(tr("Offset"),
-                                             -100, 100, 0,
-                                             m_offsetSlider, m_offsetValue));
+            // Lift / Gamma / Gain / Offset: GradingParams carries the
+            // fields and LookSerializer round-trips them, but
+            // ColorGrading::apply() never reads them. Greyed out until it
+            // does — the sliders still exist so saved values survive.
+            auto addInertAdvRow = [advLay](QWidget* row) {
+                row->setEnabled(false);
+                advLay->addWidget(row);
+            };
+            addInertAdvRow(buildSliderRow(tr("Lift"),
+                                          -100, 100, 0,
+                                          m_liftSlider, m_liftValue));
+            addInertAdvRow(buildSliderRow(tr("Gamma"),
+                                          -100, 100, 0,
+                                          m_gammaSlider, m_gammaValue));
+            addInertAdvRow(buildSliderRow(tr("Gain"),
+                                          -100, 100, 0,
+                                          m_gainSlider, m_gainValue));
+            addInertAdvRow(buildSliderRow(tr("Offset"),
+                                          -100, 100, 0,
+                                          m_offsetSlider, m_offsetValue));
             col->addWidget(advBox);
 
             // Wire each — same pattern: undo on press, write on change.
@@ -2019,11 +2106,15 @@ QWidget* MainWindow::buildControlPanel()
         // Filmic Contrast / Highlight Rolloff / Shadow Lift / Fade Blacks /
         // Color Separation. V1 placeholders.
         {
+            const QString filmTitle = tr("Filmic Look") + inertSuffix();
+            const QString filmTip   = inertTip(tr("the Filmic Look controls"));
+
             auto* filmHeader = new QToolButton(panel);
-            filmHeader->setText(QString::fromUtf8("▸ ") + tr("Filmic Look"));
+            filmHeader->setText(QString::fromUtf8("▸ ") + filmTitle);
             filmHeader->setToolButtonStyle(Qt::ToolButtonTextOnly);
             filmHeader->setAutoRaise(true);
             filmHeader->setCursor(Qt::PointingHandCursor);
+            filmHeader->setToolTip(filmTip);
             filmHeader->setStyleSheet(
                 "QToolButton { color: #b0b0b6; text-align: left; padding: 2px 4px; }"
                 "QToolButton:hover { color: #d0d0d4; }");
@@ -2035,35 +2126,45 @@ QWidget* MainWindow::buildControlPanel()
             filmLay->setSpacing(2);
             filmBox->setVisible(false);
 
+            // Enabled container / disabled rows — see addInertAdvRow above.
+            filmBox->setToolTip(filmTip);
+
             connect(filmHeader, &QToolButton::clicked, this,
-                    [filmHeader, filmBox]() {
+                    [filmHeader, filmBox, filmTitle]() {
                 const bool wasVisible = filmBox->isVisible();
                 filmBox->setVisible(!wasVisible);
                 filmHeader->setText((!wasVisible ? QString::fromUtf8("▾ ")
                                                  : QString::fromUtf8("▸ "))
-                                    + tr("Filmic Look"));
+                                    + filmTitle);
             });
 
-            filmLay->addWidget(buildSliderRow(tr("Filmic Contrast"),
-                                              -100, 100, 0,
-                                              m_filmicContrastSlider,
-                                              m_filmicContrastValue));
-            filmLay->addWidget(buildSliderRow(tr("Highlight Rolloff"),
-                                              -100, 100, 0,
-                                              m_highlightRolloffSlider,
-                                              m_highlightRolloffValue));
-            filmLay->addWidget(buildSliderRow(tr("Shadow Lift"),
-                                              -100, 100, 0,
-                                              m_shadowLiftSlider,
-                                              m_shadowLiftValue));
-            filmLay->addWidget(buildSliderRow(tr("Fade Blacks"),
-                                              -100, 100, 0,
-                                              m_fadeBlacksSlider,
-                                              m_fadeBlacksValue));
-            filmLay->addWidget(buildSliderRow(tr("Color Separation"),
-                                              -100, 100, 0,
-                                              m_colorSeparationSlider,
-                                              m_colorSeparationValue));
+            // None of these five reach the engine: src/grading/ contains no
+            // reference to filmicContrast / highlightRolloff / shadowLift /
+            // fadeBlacks / colorSeparation. Values still serialize.
+            auto addInertFilmRow = [filmLay](QWidget* row) {
+                row->setEnabled(false);
+                filmLay->addWidget(row);
+            };
+            addInertFilmRow(buildSliderRow(tr("Filmic Contrast"),
+                                           -100, 100, 0,
+                                           m_filmicContrastSlider,
+                                           m_filmicContrastValue));
+            addInertFilmRow(buildSliderRow(tr("Highlight Rolloff"),
+                                           -100, 100, 0,
+                                           m_highlightRolloffSlider,
+                                           m_highlightRolloffValue));
+            addInertFilmRow(buildSliderRow(tr("Shadow Lift"),
+                                           -100, 100, 0,
+                                           m_shadowLiftSlider,
+                                           m_shadowLiftValue));
+            addInertFilmRow(buildSliderRow(tr("Fade Blacks"),
+                                           -100, 100, 0,
+                                           m_fadeBlacksSlider,
+                                           m_fadeBlacksValue));
+            addInertFilmRow(buildSliderRow(tr("Color Separation"),
+                                           -100, 100, 0,
+                                           m_colorSeparationSlider,
+                                           m_colorSeparationValue));
             col->addWidget(filmBox);
 
             auto wireFilm = [this](QSlider* slider, QLabel* lbl,
@@ -2349,7 +2450,32 @@ QWidget* MainWindow::buildControlPanel()
         });
         col->addWidget(m_lensEnabledCheck);
 
-        m_lensRemoveCaCheck = new QCheckBox(tr("Remove Chromatic Aberration"), panel);
+        // Only vignetting compensation is engine-active. Distortion, CA and
+        // the two fringe sliders are disabled below: LensCorrectionEngine
+        // ::apply() explicitly `(void)`-casts those params away. Their data
+        // still round-trips, so nothing is lost when the math lands.
+        const QString caTip =
+            inertTip(tr("chromatic-aberration removal"));
+        const QString distortionTip =
+            inertTip(tr("lens distortion correction"));
+        const QString fringeTip =
+            inertTip(tr("purple/green fringe removal"));
+
+        // One quiet note for the group rather than a suffix on every row —
+        // the sidebar is only 320px wide and slider labels share that space
+        // with the slider itself. Styled like the other secondary notes in
+        // this panel (m_presetNameLabel, m_layerStatusLabel).
+        auto* lensNote = new QLabel(
+            tr("Only Vignetting affects the image in this build. Distortion, "
+               "chromatic aberration and fringe removal are still in "
+               "development; their values are saved with your project."),
+            panel);
+        lensNote->setWordWrap(true);
+        lensNote->setStyleSheet("color: #8a8a90; font-style: italic;");
+        col->addWidget(lensNote);
+
+        m_lensRemoveCaCheck = new QCheckBox(tr("Remove Chromatic Aberration"),
+                                            panel);
         m_lensRemoveCaCheck->setCursor(Qt::PointingHandCursor);
         connect(m_lensRemoveCaCheck, &QCheckBox::toggled, this, [this](bool on) {
             if (m_look.lens.removeChromaticAberration == on) return;
@@ -2363,24 +2489,27 @@ QWidget* MainWindow::buildControlPanel()
             // consistent with other lens controls.
             if (m_debounce) m_debounce->start();
         });
-        col->addWidget(m_lensRemoveCaCheck);
+        col->addWidget(wrapInert(m_lensRemoveCaCheck, caTip, panel));
 
-        col->addWidget(buildSliderRow(tr("Distortion"),
-                                      -100, 100, 0,
-                                      m_lensDistortionSlider,
-                                      m_lensDistortionValue));
+        col->addWidget(wrapInert(buildSliderRow(tr("Distortion"),
+                                                -100, 100, 0,
+                                                m_lensDistortionSlider,
+                                                m_lensDistortionValue),
+                                 distortionTip, panel));
         col->addWidget(buildSliderRow(tr("Vignetting"),
                                       -100, 100, 0,
                                       m_lensVignettingSlider,
                                       m_lensVignettingValue));
-        col->addWidget(buildSliderRow(tr("Purple Fringe"),
-                                      0, 100, 0,
-                                      m_lensPurpleFringeSlider,
-                                      m_lensPurpleFringeValue));
-        col->addWidget(buildSliderRow(tr("Green Fringe"),
-                                      0, 100, 0,
-                                      m_lensGreenFringeSlider,
-                                      m_lensGreenFringeValue));
+        col->addWidget(wrapInert(buildSliderRow(tr("Purple Fringe"),
+                                                0, 100, 0,
+                                                m_lensPurpleFringeSlider,
+                                                m_lensPurpleFringeValue),
+                                 fringeTip, panel));
+        col->addWidget(wrapInert(buildSliderRow(tr("Green Fringe"),
+                                                0, 100, 0,
+                                                m_lensGreenFringeSlider,
+                                                m_lensGreenFringeValue),
+                                 fringeTip, panel));
 
         // Wire each slider — same pattern as global tone sliders. One
         // undo snapshot per drag (sliderPressed), debounce on each
@@ -2841,24 +2970,63 @@ QWidget* MainWindow::buildControlPanel()
     // trip through save/load and undo/redo so projects authored now will
     // pick up rendering once the compositor lands.
     {
-        auto* layerHeader = new QLabel(tr("LAYERS"), panel);
+        const QString layersTip = inertTip(tr("adjustment-layer compositing"));
+
+        auto* layerHeader = new QLabel(tr("LAYERS") + inertSuffix(), panel);
         m_layersSection = layerHeader;
         layerHeader->setFont(hf);
+        layerHeader->setToolTip(layersTip);
         layerHeader->setStyleSheet("color: #9A9AA0; padding-top: 4px;");
         col->addWidget(layerHeader);
+
+        // Visible explanation, not just a hover tooltip: the entire section
+        // is dead, and a user staring at a greyed-out "+ Layer" button
+        // deserves to know why without hunting for it.
+        auto* layersNote = new QLabel(
+            tr("Adjustment layers are not composited by the render pipeline "
+               "yet, so this section is disabled. Layer data in existing "
+               "projects is preserved and will render once compositing "
+               "lands."),
+            panel);
+        layersNote->setWordWrap(true);
+        layersNote->setStyleSheet("color: #8a8a90; font-style: italic;");
+        col->addWidget(layersNote);
+
+        // Everything below lives in `layersBox`, which is disabled as a
+        // whole. Disabling the ancestor beats any setEnabled(true) that
+        // refreshLayerWidgets() performs on the individual children, so the
+        // section cannot come back to life by loading a project that
+        // already has layers in it. `layersHost` stays enabled purely so it
+        // can answer the tooltip request that the disabled subtree
+        // propagates upward.
+        auto* layersHost = new QWidget(panel);
+        layersHost->setToolTip(layersTip);
+        auto* layersHostLay = new QVBoxLayout(layersHost);
+        layersHostLay->setContentsMargins(0, 0, 0, 0);
+        layersHostLay->setSpacing(0);
+
+        auto* layersBox = new QWidget(layersHost);
+        auto* layersBoxLay = new QVBoxLayout(layersBox);
+        layersBoxLay->setContentsMargins(0, 0, 0, 0);
+        layersBoxLay->setSpacing(col->spacing());
+        layersHostLay->addWidget(layersBox);
+        col->addWidget(layersHost);
+
+        // From here on the section builds into `layersBoxLay`, not `col`.
+        QVBoxLayout* const layersCol = layersBoxLay;
 
         // Add / Duplicate / Delete row.
         auto* btnRow = new QHBoxLayout();
         btnRow->setContentsMargins(0, 0, 0, 0);
         btnRow->setSpacing(4);
-        m_layerAddBtn = new QPushButton(tr("+ Layer"), panel);
+        m_layerAddBtn = new QPushButton(tr("+ Layer"), layersBox);
         m_layerAddBtn->setCursor(Qt::PointingHandCursor);
         m_layerAddBtn->setToolTip(tr("Add a new adjustment layer"));
         connect(m_layerAddBtn, &QPushButton::clicked,
                 this, &MainWindow::onAddLayer);
         btnRow->addWidget(m_layerAddBtn);
 
-        m_layerDuplicateBtn = new QPushButton(tr("Duplicate"), panel);
+        m_layerDuplicateBtn = new QPushButton(tr("Duplicate"), layersBox);
         m_layerDuplicateBtn->setCursor(Qt::PointingHandCursor);
         m_layerDuplicateBtn->setToolTip(tr("Duplicate the selected layer"));
         m_layerDuplicateBtn->setEnabled(false);
@@ -2866,17 +3034,17 @@ QWidget* MainWindow::buildControlPanel()
                 this, &MainWindow::onDuplicateLayer);
         btnRow->addWidget(m_layerDuplicateBtn);
 
-        m_layerDeleteBtn = new QPushButton(tr("Delete"), panel);
+        m_layerDeleteBtn = new QPushButton(tr("Delete"), layersBox);
         m_layerDeleteBtn->setCursor(Qt::PointingHandCursor);
         m_layerDeleteBtn->setEnabled(false);
         connect(m_layerDeleteBtn, &QPushButton::clicked,
                 this, &MainWindow::onDeleteSelectedLayer);
         btnRow->addWidget(m_layerDeleteBtn);
-        col->addLayout(btnRow);
+        layersCol->addLayout(btnRow);
 
         // Layer list — same widget pattern as masks. Per-row checkbox
         // for enabled-state, selection drives the opacity/blend controls.
-        m_layerList = new QListWidget(panel);
+        m_layerList = new QListWidget(layersBox);
         m_layerList->setSelectionMode(QAbstractItemView::SingleSelection);
         m_layerList->setMinimumHeight(80);
         m_layerList->setMaximumHeight(140);
@@ -2891,15 +3059,15 @@ QWidget* MainWindow::buildControlPanel()
                 this, &MainWindow::onLayerListSelectionChanged);
         connect(m_layerList, &QListWidget::itemChanged,
                 this, &MainWindow::onLayerItemChanged);
-        col->addWidget(m_layerList);
+        layersCol->addWidget(m_layerList);
 
         // Status label.
-        m_layerStatusLabel = new QLabel(tr("No layers"), panel);
+        m_layerStatusLabel = new QLabel(tr("No layers"), layersBox);
         m_layerStatusLabel->setStyleSheet("color: #8a8a90; font-style: italic;");
-        col->addWidget(m_layerStatusLabel);
+        layersCol->addWidget(m_layerStatusLabel);
 
         // Opacity slider — 0..100% mapped to layer.opacity ∈ [0, 1].
-        col->addWidget(buildSliderRow(tr("Opacity"),
+        layersCol->addWidget(buildSliderRow(tr("Opacity"),
                                       0, 100, 100,
                                       m_layerOpacitySlider, m_layerOpacityValue));
         connect(m_layerOpacitySlider, &QSlider::sliderPressed,
@@ -2911,10 +3079,10 @@ QWidget* MainWindow::buildControlPanel()
         // enum value — keep this list in sync with the enum.
         auto* blendRow = new QHBoxLayout();
         blendRow->setContentsMargins(0, 0, 0, 0);
-        auto* blendLabel = new QLabel(tr("Blend"), panel);
+        auto* blendLabel = new QLabel(tr("Blend"), layersBox);
         blendLabel->setMinimumWidth(60);
         blendRow->addWidget(blendLabel);
-        m_layerBlendModeCombo = new QComboBox(panel);
+        m_layerBlendModeCombo = new QComboBox(layersBox);
         m_layerBlendModeCombo->addItem(tr("Normal"));
         m_layerBlendModeCombo->addItem(tr("Multiply"));
         m_layerBlendModeCombo->addItem(tr("Screen"));
@@ -2930,10 +3098,16 @@ QWidget* MainWindow::buildControlPanel()
         connect(m_layerBlendModeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
                 this, &MainWindow::onLayerBlendModeChanged);
         blendRow->addWidget(m_layerBlendModeCombo, /*stretch=*/1);
-        col->addLayout(blendRow);
+        layersCol->addLayout(blendRow);
 
         // Initial state — no layers, controls disabled.
         refreshLayerWidgets();
+
+        // ...and the whole section stays disabled on top of that, because
+        // ImagePipeline never reads Look::adjustmentLayers. This must come
+        // after refreshLayerWidgets(): it toggles children, this disables
+        // their common ancestor, and the ancestor wins.
+        layersBox->setEnabled(false);
     }
 
     col->addStretch(1);
@@ -5090,6 +5264,13 @@ void MainWindow::buildMenus()
         auto* nodeGraph = m->addAction(tr("Node Graph..."));
         connect(nodeGraph, &QAction::triggered,
                 this, &MainWindow::onShowNodeGraph);
+
+        if (m_aiDock) {
+            m->addSeparator();
+            auto* aiToggle = m_aiDock->toggleViewAction();
+            aiToggle->setText(tr("Photo &Assistant"));
+            m->addAction(aiToggle);
+        }
     }
 
     // ---- Plugins menu -----------------------------------------------------
@@ -5381,21 +5562,27 @@ void MainWindow::refreshLensWidgets()
     if (m_lensRemoveCaCheck) {
         QSignalBlocker b(m_lensRemoveCaCheck);
         m_lensRemoveCaCheck->setChecked(lp.removeChromaticAberration);
-        m_lensRemoveCaCheck->setEnabled(lp.enabled);
+        // Stays disabled regardless of the master switch — CA removal is a
+        // no-op in LensCorrectionEngine. (The wrapper built in
+        // buildControlPanel() also keeps it disabled, but being explicit
+        // here stops a future edit from silently re-enabling it.)
+        m_lensRemoveCaCheck->setEnabled(false);
     }
 
-    auto setSlider = [&](QSlider* s, QLabel* lbl, float v) {
+    // `engineActive` = does LensCorrectionEngine actually consume this
+    // param? Vignetting yes; distortion / fringes are `(void)`-cast away.
+    auto setSlider = [&](QSlider* s, QLabel* lbl, float v, bool engineActive) {
         if (!s) return;
         const int iv = static_cast<int>(std::lround(v));
         QSignalBlocker b(s);
         s->setValue(iv);
-        s->setEnabled(lp.enabled);
+        s->setEnabled(lp.enabled && engineActive);
         if (lbl) lbl->setText(QString::number(iv));
     };
-    setSlider(m_lensDistortionSlider,   m_lensDistortionValue,   lp.distortion);
-    setSlider(m_lensVignettingSlider,   m_lensVignettingValue,   lp.vignetting);
-    setSlider(m_lensPurpleFringeSlider, m_lensPurpleFringeValue, lp.purpleFringe);
-    setSlider(m_lensGreenFringeSlider,  m_lensGreenFringeValue,  lp.greenFringe);
+    setSlider(m_lensDistortionSlider,   m_lensDistortionValue,   lp.distortion,   false);
+    setSlider(m_lensVignettingSlider,   m_lensVignettingValue,   lp.vignetting,   true);
+    setSlider(m_lensPurpleFringeSlider, m_lensPurpleFringeValue, lp.purpleFringe, false);
+    setSlider(m_lensGreenFringeSlider,  m_lensGreenFringeValue,  lp.greenFringe,  false);
 }
 
 // ==============================================================================
@@ -5559,10 +5746,13 @@ void MainWindow::onAddBrushMask()
     m.feather   = 0.5f;
     m.flow      = 0.5f;
     m.density   = 1.0f;
-    // Brush is a placeholder — V1 LocalAdjustmentEngine treats brush masks
-    // as zero-weight everywhere, so this entry is inert until the brush
-    // UI lands. The data round-trips through save/load correctly, which
-    // is the spec's first-version requirement.
+    // Note: brush masks are live. The comment that used to sit here said
+    // LocalAdjustmentEngine treats them as zero-weight everywhere; that is
+    // no longer true — maskWeightBrush() in src/local/MaskGeometry.h walks
+    // the real stroke/stamp list and applies flow, density and erase. The
+    // stroke list starts empty, so a freshly added brush mask affects
+    // nothing until the user actually paints, which is what the stale
+    // comment was probably describing.
     addMaskCommon(std::move(m), tr("Brush"));
 }
 
@@ -6209,12 +6399,19 @@ void MainWindow::buildGradingWheel(QWidget* parent, QVBoxLayout* col,
     boxLay->addLayout(wheelRow);
 
     // Strength + Luminance sliders.
+    //
+    // Strength is engine-active. Luminance is NOT: ColorGrading::apply()
+    // reads shadows/midtones/highlights/global Hue, Saturation and Strength
+    // but never the matching *Luminance fields, so the slider moves zero
+    // pixels. Disabled here; the field keeps serializing.
     boxLay->addWidget(buildSliderRow(tr("Strength"),
                                      0, 100, 0,
                                      w.str, w.strValue));
-    boxLay->addWidget(buildSliderRow(tr("Luminance"),
-                                     -100, +100, 0,
-                                     w.lum, w.lumValue));
+    boxLay->addWidget(wrapInert(buildSliderRow(tr("Luminance"),
+                                               -100, +100, 0,
+                                               w.lum, w.lumValue),
+                                inertTip(tr("per-range Luminance")),
+                                box));
 
     col->addWidget(box);
     w.slidersBox = box;

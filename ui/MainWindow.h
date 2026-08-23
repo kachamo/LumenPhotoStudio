@@ -308,6 +308,10 @@ private:
     NodeGraphWidget* m_nodeGraph     = nullptr;
     QDockWidget*     m_nodeGraphDock = nullptr;
 
+    // Bring-your-own-key AI assistant. Self-contained: the panel owns its
+    // own client and settings, so MainWindow only hosts the dock.
+    QDockWidget*     m_aiDock        = nullptr;
+
     std::unique_ptr<lps::PluginManager> m_pluginManager;
     std::unique_ptr<lps::SettingsManager> m_settings;
     std::unique_ptr<lps::AutosaveManager> m_autosaveManager;
