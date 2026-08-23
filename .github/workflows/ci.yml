@@ -221,9 +221,11 @@ jobs:
           "${{ steps.locate.outputs.binary }}" --smoke-test
           echo "Smoke test exited 0 on ${{ runner.os }}"
 
-      # TEMPORARY: capture a backtrace when the smoke test crashes on macOS.
-      # A segfault with no stack is not actionable, and the crash is not
-      # reproducible on the Windows dev machine. Remove once diagnosed.
+      # A bare "Segmentation fault: 11" is not actionable, and crashes that
+      # only reproduce on a runner are the norm — the first one here was a
+      # use-after-free in CatalogGridView's event filter that Windows and
+      # Linux silently tolerated. Keep the backtrace; it costs nothing on a
+      # green run and saves a debug round trip on a red one.
       - name: Backtrace on macOS smoke-test crash
         if: ${{ failure() && steps.smoke.outcome == 'failure' && runner.os == 'macOS' }}
         env:

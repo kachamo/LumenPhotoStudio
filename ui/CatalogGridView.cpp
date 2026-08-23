@@ -101,7 +101,8 @@ const QColor kTileBgSel  (0xCC, 0xFF, 0x00, 36);
 const QColor kTileBorder (0x2A, 0x2D, 0x35);
 const QColor kWellBg     (0x0E, 0x0F, 0x12);
 const QColor kTextPrimary(0xDD, 0xE0, 0xE7);
-const QColor kTextDim    (0x9E, 0xA4, 0xAE);
+// kTextDim was used by an earlier delegate layout; kept out of the build
+// rather than left dangling — clang warns where MinGW does not.
 const QColor kStarOff    (0x3D, 0x42, 0x4E);
 const QColor kGlyph      (0x26, 0x2A, 0x31);
 const QColor kRejectRed  (0xE2, 0x60, 0x5F);
@@ -595,6 +596,10 @@ struct CatalogGridView::Impl
 {
     explicit Impl(CatalogGridView* owner) : q(owner) {}
 
+    // The grid's event filter. Held so ~CatalogGridView can detach it before
+    // freeing this Impl — see the destructor for why that ordering matters.
+    QObject* hook = nullptr;
+
     // ---- thumbnail scheduling ----------------------------------------------
     void scheduleScan();
     void scanVisible();
@@ -943,6 +948,10 @@ CatalogGridView::CatalogGridView(QWidget* parent)
 
     auto* hook = new GridEventHook(
         [this](QObject* watched, QEvent* event) {
+            // Defence in depth: the destructor detaches this filter before
+            // freeing d, but a null d must never be dereferenced if some
+            // path still routes an event here.
+            if (!d) return false;
             if (watched == d->view) {
                 if (event->type() == QEvent::KeyPress)
                     return d->handleKey(static_cast<QKeyEvent*>(event));
@@ -955,6 +964,7 @@ CatalogGridView::CatalogGridView(QWidget* parent)
             return false;
         },
         this);
+    d->hook = hook;
     d->view->installEventFilter(hook);
     d->view->viewport()->installEventFilter(hook);
 
@@ -969,7 +979,30 @@ CatalogGridView::~CatalogGridView()
     d->aborted = true;
     d->pool.clear();
     d->pool.waitForDone();
+
+    // Detach the event filter BEFORE freeing d.
+    //
+    // The hook is parented to `this`, so Qt destroys it inside the base
+    // ~QWidget — which runs *after* this body. While ~QWidget tears down our
+    // children it sends them events, those events pass through the still
+    // installed filter, and the handler dereferences `d` on its first line.
+    //
+    // macOS caught this as EXC_BAD_ACCESS in QAbstractScrollArea::viewport(),
+    // called from GridEventHook::eventFilter during QListView destruction.
+    // Windows and Linux only survived because no event happened to be
+    // delivered in that window — it was a latent use-after-free on all three.
+    if (d->hook) {
+        if (d->view) {
+            d->view->removeEventFilter(d->hook);
+            if (QWidget* vp = d->view->viewport())
+                vp->removeEventFilter(d->hook);
+        }
+        delete d->hook;
+        d->hook = nullptr;
+    }
+
     delete d;
+    d = nullptr;   // the handler's guard reads this
 }
 
 void CatalogGridView::setImages(const QVector<lps::CatalogImage>& images)
