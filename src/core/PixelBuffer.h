@@ -61,7 +61,31 @@ public:
 
     // Convert back to an sRGB-encoded ARGB32 QImage. The internal linear
     // buffer is unchanged — safe to call multiple times.
+    //
+    // This is the interactive preview path and is deliberately left exactly
+    // as it was: 8 bits per channel, no colour-space tag, no branches added.
     QImage toSrgbImage() const;
+
+    // Convert back to an sRGB-encoded 16-bit-per-channel QImage. The export
+    // counterpart of toSrgbImage(); the internal linear buffer is unchanged.
+    //
+    // Format: Format_RGBA64, downgraded in place to Format_RGBX64 when every
+    // pixel came out fully opaque. The two formats have identical memory
+    // layout (four native-endian quint16 R,G,B,A/X), so the downgrade is a
+    // zero-copy reinterpretAsFormat() and costs nothing — but it means an
+    // ordinary opaque photograph exports as 16-bit RGB with no alpha channel
+    // instead of carrying a pointless all-0xffff plane, which is both 25%
+    // smaller and what print workflows expect from a TIFF/PNG master.
+    //
+    // The result is tagged QColorSpace(QColorSpace::SRgb). Without a tag,
+    // QImage::convertToColorSpace() is a silent no-op, so the tag is what
+    // makes downstream colour conversion meaningful rather than decorative.
+    //
+    // Memory: 8 bytes/pixel, so 360 MB for a 45 MP frame, on top of the
+    // 16 bytes/pixel float buffer it is read from. Callers exporting at full
+    // resolution should release any other full-size image they are holding
+    // before calling this.
+    QImage toSrgb16Image() const;
 
     // Direct access for engines. Caller must respect width()/height()/stride.
     float*       data()       { return m_pixels.data(); }

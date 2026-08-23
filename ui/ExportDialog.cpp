@@ -3,8 +3,11 @@
 // ==============================================================================
 #include "ExportDialog.h"
 
+#include <QBuffer>
 #include <QByteArray>
 #include <QCheckBox>
+#include <QColor>
+#include <QColorSpace>
 #include <QComboBox>
 #include <QDialogButtonBox>
 #include <QDir>
@@ -13,17 +16,22 @@
 #include <QFont>
 #include <QFormLayout>
 #include <QFrame>
+#include <QHash>
 #include <QHBoxLayout>
+#include <QImage>
+#include <QImageWriter>
 #include <QInputDialog>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
 #include <QPushButton>
+#include <QRgba64>
 #include <QSettings>
 #include <QSlider>
 #include <QSpinBox>
 #include <QStringList>
 #include <QVBoxLayout>
+#include <QVariant>
 
 #include <algorithm>
 #include <cmath>
@@ -63,6 +71,44 @@ QLabel* makeSectionTitle(const QString& text, QWidget* parent)
     return label;
 }
 
+// ---- Colour space identifiers -----------------------------------------------
+// Options::colorSpace holds one of these stable, untranslated keys. The combo
+// shows tr()'d display names; the key travels in the item's user data so a
+// translated build still round-trips through QSettings correctly.
+const char* const kCsSRgb       = "sRGB";
+const char* const kCsAdobeRgb   = "AdobeRGB";
+const char* const kCsDisplayP3  = "DisplayP3";
+const char* const kCsProPhoto   = "ProPhotoRGB";
+
+// Map anything we might read back — a current key, or one of the two
+// "... placeholder" strings that shipped in earlier saved presets — onto a
+// current key. Matching is loose on purpose: the legacy values were literally
+// "Display P3 placeholder" and "Adobe RGB placeholder", and a preset saved by
+// a localized build could hold a translated display name.
+QString normalizeColorSpaceKey(const QString& raw)
+{
+    const QString v = raw.trimmed();
+    if (v.contains(QLatin1String("prophoto"), Qt::CaseInsensitive)
+        || v.contains(QLatin1String("pro photo"), Qt::CaseInsensitive))
+        return QString::fromLatin1(kCsProPhoto);
+    if (v.contains(QLatin1String("adobe"), Qt::CaseInsensitive))
+        return QString::fromLatin1(kCsAdobeRgb);
+    if (v.contains(QLatin1String("p3"), Qt::CaseInsensitive))
+        return QString::fromLatin1(kCsDisplayP3);
+    return QString::fromLatin1(kCsSRgb);
+}
+
+// Select the combo entry whose user data equals `data`. Returns false and
+// leaves the combo alone if there is no such entry.
+bool setComboByData(QComboBox* combo, const QVariant& data)
+{
+    if (!combo) return false;
+    const int index = combo->findData(data);
+    if (index < 0) return false;
+    combo->setCurrentIndex(index);
+    return true;
+}
+
 QString cleanBaseName(QString name)
 {
     name = name.trimmed();
@@ -91,6 +137,20 @@ QByteArray ExportDialog::Options::imageFormat() const
     return extension().toLatin1();
 }
 
+QColorSpace ExportDialog::Options::targetColorSpace() const
+{
+    const QString key = normalizeColorSpaceKey(colorSpace);
+    if (key == QLatin1String(kCsAdobeRgb))  return QColorSpace(QColorSpace::AdobeRgb);
+    if (key == QLatin1String(kCsDisplayP3)) return QColorSpace(QColorSpace::DisplayP3);
+    if (key == QLatin1String(kCsProPhoto))  return QColorSpace(QColorSpace::ProPhotoRgb);
+    return QColorSpace(QColorSpace::SRgb);
+}
+
+bool ExportDialog::Options::isWideGamut() const
+{
+    return normalizeColorSpaceKey(colorSpace) != QLatin1String(kCsSRgb);
+}
+
 QString ExportDialog::Options::outputPath() const
 {
     QString name = fileName.trimmed();
@@ -108,6 +168,46 @@ QString ExportDialog::Options::outputPath() const
     return QDir(outputFolder).filePath(name);
 }
 
+bool ExportDialog::formatSupports16Bit(const QByteArray& imageFormat)
+{
+    const QByteArray key = imageFormat.toLower();
+
+    // GUI-thread only, so a plain static cache needs no locking. The probe
+    // itself is a handful of microseconds on a 2x2 image, but it is called
+    // on every format change, so caching keeps the dialog snappy.
+    static QHash<QByteArray, bool> cache;
+    const auto cached = cache.constFind(key);
+    if (cached != cache.constEnd())
+        return *cached;
+
+    bool supported = false;
+    if (QImageWriter::supportedImageFormats().contains(key)) {
+        // Write a 2x2 Format_RGBA64 image through the real codec into memory
+        // and read the depth back. Nothing short of this is trustworthy:
+        // QImageWriter reports "jpg" as supported and then silently writes
+        // 8 bits per channel, and a Qt build missing the TIFF plugin reports
+        // the format as unsupported rather than degrading loudly.
+        QImage probe(2, 2, QImage::Format_RGBA64);
+        probe.fill(QColor::fromRgba64(0xFFFF, 0x8000, 0x1234, 0xFFFF));
+        probe.setColorSpace(QColorSpace(QColorSpace::SRgb));
+
+        QByteArray encoded;
+        QBuffer device(&encoded);
+        if (device.open(QIODevice::WriteOnly)) {
+            QImageWriter writer(&device, key);
+            const bool written = writer.write(probe);
+            device.close();
+            if (written) {
+                const QImage readBack = QImage::fromData(encoded, key.constData());
+                supported = !readBack.isNull() && readBack.depth() == 64;
+            }
+        }
+    }
+
+    cache.insert(key, supported);
+    return supported;
+}
+
 ExportDialog::ExportDialog(const QString& defaultFolder,
                            const QString& defaultFileName,
                            const QSize& sourceSize,
@@ -121,6 +221,8 @@ ExportDialog::ExportDialog(const QString& defaultFolder,
     buildUi(defaultFolder, defaultFileName);
     loadPresetNames();
     updateQualityState();
+    updateBitDepthState();
+    updateColorManagementWarning();
     updateResizeState();
 }
 
@@ -129,11 +231,15 @@ ExportDialog::Options ExportDialog::options() const
     Options out;
     out.format = m_formatCombo->currentText();
     out.quality = m_qualitySlider->value();
+    // The combo is forced to 8 by updateBitDepthState() whenever 16 is not
+    // deliverable, so reading it back is safe — there is no separate "what
+    // the user asked for" to diverge from.
+    out.bitDepth = m_bitDepthCombo->currentData().toInt() == 16 ? 16 : 8;
     out.resize = m_resizeCheck->isChecked();
     out.width = m_widthSpin->value();
     out.height = m_heightSpin->value();
     out.preserveAspectRatio = m_preserveAspectCheck->isChecked();
-    out.colorSpace = m_colorSpaceCombo->currentText();
+    out.colorSpace = normalizeColorSpaceKey(m_colorSpaceCombo->currentData().toString());
     out.includeMetadata = m_includeMetadataCheck->isChecked();
     out.outputFolder = QDir::fromNativeSeparators(m_outputFolderEdit->text().trimmed());
     out.fileName = m_fileNameEdit->text().trimmed();
@@ -309,6 +415,15 @@ void ExportDialog::buildUi(const QString& defaultFolder, const QString& defaultF
             m_formatCombo->setCurrentText(QStringLiteral("PNG"));
         form->addRow(tr("Format"), m_formatCombo);
 
+        // Bit depth. 16-bit is what makes the float pipeline worth having on
+        // the way out; 8-bit stays the default so nothing changes for users
+        // who just want a JPEG for the web.
+        m_bitDepthCombo = new QComboBox(card);
+        m_bitDepthCombo->addItem(tr("8-bit"), 8);
+        m_bitDepthCombo->addItem(tr("16-bit"), 16);
+        m_bitDepthCombo->setCurrentIndex(0);
+        form->addRow(tr("Bit Depth"), m_bitDepthCombo);
+
         auto* qualityRow = new QWidget(card);
         auto* qualityLay = new QHBoxLayout(qualityRow);
         qualityLay->setContentsMargins(0, 0, 0, 0);
@@ -323,13 +438,23 @@ void ExportDialog::buildUi(const QString& defaultFolder, const QString& defaultF
         qualityLay->addWidget(m_qualityValue);
         form->addRow(tr("Quality"), qualityRow);
 
+        // Real colour management. Picking one of these CONVERTS the pixels
+        // (see MainWindow's export path) and embeds the matching ICC profile;
+        // it does not merely relabel sRGB data, which is what the previous
+        // "placeholder" entries did and is worse than offering nothing.
         m_colorSpaceCombo = new QComboBox(card);
-        m_colorSpaceCombo->addItems(QStringList{
-            tr("sRGB"),
-            tr("Display P3 placeholder"),
-            tr("Adobe RGB placeholder"),
-        });
+        m_colorSpaceCombo->addItem(tr("sRGB"), QString::fromLatin1(kCsSRgb));
+        m_colorSpaceCombo->addItem(tr("Adobe RGB (1998)"), QString::fromLatin1(kCsAdobeRgb));
+        m_colorSpaceCombo->addItem(tr("Display P3"), QString::fromLatin1(kCsDisplayP3));
+        m_colorSpaceCombo->addItem(tr("ProPhoto RGB"), QString::fromLatin1(kCsProPhoto));
+        m_colorSpaceCombo->setCurrentIndex(0);
         form->addRow(tr("Color Space"), m_colorSpaceCombo);
+
+        m_colorManagementNote = new QLabel(card);
+        m_colorManagementNote->setWordWrap(true);
+        m_colorManagementNote->setStyleSheet(QStringLiteral("color: #E8B33C;"));
+        m_colorManagementNote->setVisible(false);
+        form->addRow(QString(), m_colorManagementNote);
 
         m_includeMetadataCheck = new QCheckBox(tr("Include metadata"), card);
         m_includeMetadataCheck->setChecked(true);
@@ -340,10 +465,18 @@ void ExportDialog::buildUi(const QString& defaultFolder, const QString& defaultF
 
         connect(m_formatCombo, &QComboBox::currentTextChanged, this, [this]() {
             updateQualityState();
+            updateBitDepthState();
+            updateColorManagementWarning();
             updateFileNameExtension();
         });
         connect(m_qualitySlider, &QSlider::valueChanged, this, [this](int value) {
             m_qualityValue->setText(QString::number(value));
+        });
+        connect(m_bitDepthCombo, &QComboBox::currentIndexChanged, this, [this]() {
+            updateColorManagementWarning();
+        });
+        connect(m_colorSpaceCombo, &QComboBox::currentIndexChanged, this, [this]() {
+            updateColorManagementWarning();
         });
     }
 
@@ -466,6 +599,7 @@ void ExportDialog::applyPreset(const QString& name)
         }
         preset.format = settings.value(QStringLiteral("format"), QStringLiteral("PNG")).toString();
         preset.quality = settings.value(QStringLiteral("quality"), 90).toInt();
+        preset.bitDepth = settings.value(QStringLiteral("bitDepth"), 8).toInt();
         preset.resize = settings.value(QStringLiteral("resize"), false).toBool();
         preset.width = settings.value(QStringLiteral("width"), m_sourceSize.width()).toInt();
         preset.height = settings.value(QStringLiteral("height"), m_sourceSize.height()).toInt();
@@ -477,15 +611,25 @@ void ExportDialog::applyPreset(const QString& name)
 
     m_formatCombo->setCurrentText(preset.format);
     m_qualitySlider->setValue(std::clamp(preset.quality, 1, 100));
+    // Presets saved before bit depth existed, and presets asking for a depth
+    // this build cannot write, both end up at 8 — the combo is the source of
+    // truth and updateBitDepthState() below has the final say.
+    setComboByData(m_bitDepthCombo, QVariant(preset.bitDepth == 16 ? 16 : 8));
     m_resizeCheck->setChecked(preset.resize);
     m_preserveAspectCheck->setChecked(preset.preserveAspectRatio);
     m_syncingSize = true;
     m_widthSpin->setValue(std::clamp(preset.width, 1, kMaxExportDimension));
     m_heightSpin->setValue(std::clamp(preset.height, 1, kMaxExportDimension));
     m_syncingSize = false;
-    m_colorSpaceCombo->setCurrentText(preset.colorSpace);
+    // Legacy presets hold "Adobe RGB placeholder" / "Display P3 placeholder";
+    // normalizeColorSpaceKey() maps those onto the real spaces they were
+    // pretending to be, so loading one now does what it always claimed to.
+    setComboByData(m_colorSpaceCombo,
+                   QVariant(normalizeColorSpaceKey(preset.colorSpace)));
     m_includeMetadataCheck->setChecked(preset.includeMetadata);
     updateQualityState();
+    updateBitDepthState();
+    updateColorManagementWarning();
     updateResizeState();
     updateFileNameExtension();
 }
@@ -497,6 +641,7 @@ void ExportDialog::savePreset(const QString& name, const Options& options)
     settings.setValue(QStringLiteral("name"), name);
     settings.setValue(QStringLiteral("format"), options.format);
     settings.setValue(QStringLiteral("quality"), options.quality);
+    settings.setValue(QStringLiteral("bitDepth"), options.bitDepth);
     settings.setValue(QStringLiteral("resize"), options.resize);
     settings.setValue(QStringLiteral("width"), options.width);
     settings.setValue(QStringLiteral("height"), options.height);
@@ -513,6 +658,80 @@ void ExportDialog::updateQualityState()
         || format == QStringLiteral("WEBP");
     m_qualitySlider->setEnabled(enabled);
     m_qualityValue->setEnabled(enabled);
+}
+
+void ExportDialog::updateBitDepthState()
+{
+    if (!m_bitDepthCombo || !m_formatCombo)
+        return;
+
+    Options probe;
+    probe.format = m_formatCombo->currentText();
+    const QString format = probe.format;
+    const bool isJpeg = format.compare(QStringLiteral("JPG"), Qt::CaseInsensitive) == 0;
+    const bool isWebp = format.compare(QStringLiteral("WEBP"), Qt::CaseInsensitive) == 0;
+    const bool can16  = formatSupports16Bit(probe.imageFormat());
+
+    if (can16) {
+        m_bitDepthCombo->setEnabled(true);
+        m_bitDepthCombo->setToolTip(
+            tr("16-bit keeps the precision the editing pipeline works at. "
+               "Use it for masters and for anything that will be edited "
+               "again; 8-bit is fine for delivery."));
+        return;
+    }
+
+    // Not deliverable at 16 bits — force the control to 8 rather than let the
+    // dialog show a depth the writer will quietly discard.
+    setComboByData(m_bitDepthCombo, QVariant(8));
+    m_bitDepthCombo->setEnabled(false);
+
+    if (isJpeg) {
+        m_bitDepthCombo->setToolTip(
+            tr("JPEG stores 8 bits per channel by specification. "
+               "Choose PNG or TIFF to export 16-bit."));
+    } else if (isWebp) {
+        m_bitDepthCombo->setToolTip(
+            tr("WebP stores 8 bits per channel. "
+               "Choose PNG or TIFF to export 16-bit."));
+    } else {
+        // e.g. TIFF on a Qt build whose imageformats plugin is absent. Say so
+        // plainly instead of pretending the option exists.
+        m_bitDepthCombo->setToolTip(
+            tr("This build of Qt cannot write %1 at 16 bits per channel, "
+               "so only 8-bit is available for this format.")
+                .arg(format));
+    }
+}
+
+void ExportDialog::updateColorManagementWarning()
+{
+    if (!m_colorManagementNote)
+        return;
+
+    const Options opts = options();
+    if (!opts.isWideGamut() || opts.bitDepth >= 16) {
+        m_colorManagementNote->setVisible(false);
+        m_colorManagementNote->clear();
+        return;
+    }
+
+    // Wide-gamut spaces spread the same 256 codes over a much larger volume
+    // of colour, so 8-bit output bands where sRGB would not. ProPhoto is the
+    // classic trap — its gamut is so large that a meaningful fraction of the
+    // encoding is spent on colours no real device can show.
+    const QString space = normalizeColorSpaceKey(opts.colorSpace);
+    if (space == QLatin1String(kCsProPhoto)) {
+        m_colorManagementNote->setText(
+            tr("ProPhoto RGB at 8-bit will band visibly in skies and skin "
+               "tones — its gamut is far wider than 8 bits can encode "
+               "smoothly. Export 16-bit, or choose sRGB."));
+    } else {
+        m_colorManagementNote->setText(
+            tr("Wide-gamut output at 8-bit can show banding in smooth "
+               "gradients. 16-bit is recommended for this color space."));
+    }
+    m_colorManagementNote->setVisible(true);
 }
 
 void ExportDialog::updateResizeState()
@@ -572,6 +791,7 @@ ExportDialog::Options ExportDialog::builtInPreset(const QString& name,
     if (name == QStringLiteral("Web")) {
         preset.format = QStringLiteral("JPG");
         preset.quality = 82;
+        preset.bitDepth = 8;
         preset.resize = true;
         preset.width = 2048;
         preset.height = 2048;
@@ -579,11 +799,16 @@ ExportDialog::Options ExportDialog::builtInPreset(const QString& name,
     } else if (name == QStringLiteral("Print")) {
         preset.format = QStringLiteral("TIFF");
         preset.quality = 100;
+        // A print master is exactly the case 16-bit exists for. If the Qt
+        // build cannot write 16-bit TIFF, updateBitDepthState() drops this
+        // back to 8 when the preset is applied.
+        preset.bitDepth = 16;
         preset.resize = false;
         preset.includeMetadata = true;
     } else if (name == QStringLiteral("Full Quality")) {
         preset.format = QStringLiteral("PNG");
         preset.quality = 100;
+        preset.bitDepth = 16;
         preset.resize = false;
         preset.includeMetadata = true;
     } else if (name == QStringLiteral("Social Media")) {
@@ -592,6 +817,7 @@ ExportDialog::Options ExportDialog::builtInPreset(const QString& name,
         preset.resize = true;
         preset.width = 1600;
         preset.height = 1600;
+        preset.bitDepth = 8;
         preset.includeMetadata = false;
     }
     return preset;

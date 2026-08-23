@@ -72,6 +72,15 @@ RenderResult ImagePipeline::renderUpTo(const QImage& input, Look look, Stage sta
     // ----- Convert to linear-float working buffer (one pass, no extra copy).
     PixelBuffer buffer = PixelBuffer::fromSrgbImage(workingSrgb);
 
+    runEngines(buffer, look, stage);
+
+    result.image     = buffer.toSrgbImage();
+    result.elapsedMs = timer.nsecsElapsed() / 1'000'000.0;
+    return result;
+}
+
+void ImagePipeline::runEngines(PixelBuffer& buffer, const Look& look, Stage stage) const
+{
     // ----- Run engines in fixed order. Each engine:
     //   - Checks its own params.isIdentity() and returns early if so.
     //   - Mutates the shared `buffer` in place.
@@ -84,39 +93,29 @@ RenderResult ImagePipeline::renderUpTo(const QImage& input, Look look, Stage sta
     // placeholders.
     LensCorrectionEngine::apply(buffer, look.lens);
     if (stage == Stage::AfterLens) {
-        result.image     = buffer.toSrgbImage();
-        result.elapsedMs = timer.nsecsElapsed() / 1'000'000.0;
-        return result;
+        return;
     }
 
     TransformEngine::apply(buffer, look.transform);
     if (stage == Stage::AfterTransform) {
-        result.image     = buffer.toSrgbImage();
-        result.elapsedMs = timer.nsecsElapsed() / 1'000'000.0;
-        return result;
+        return;
     }
 
     HDRToneMapper::apply(buffer, look.hdr);
 
     ToneEngine::apply(buffer, look.tone);
     if (stage == Stage::AfterTone) {
-        result.image     = buffer.toSrgbImage();
-        result.elapsedMs = timer.nsecsElapsed() / 1'000'000.0;
-        return result;
+        return;
     }
 
     ColorEngine::apply(buffer, look.color);
     if (stage == Stage::AfterColor) {
-        result.image     = buffer.toSrgbImage();
-        result.elapsedMs = timer.nsecsElapsed() / 1'000'000.0;
-        return result;
+        return;
     }
 
     CurveEngine::apply(buffer, look.curves);
     if (stage == Stage::AfterCurve) {
-        result.image     = buffer.toSrgbImage();
-        result.elapsedMs = timer.nsecsElapsed() / 1'000'000.0;
-        return result;
+        return;
     }
 
     // Local masks slot between curves and grading. Per spec: "after global
@@ -127,22 +126,36 @@ RenderResult ImagePipeline::renderUpTo(const QImage& input, Look look, Stage sta
 
     ColorGrading::apply(buffer, look.grading);
     if (stage == Stage::AfterGrading) {
-        result.image     = buffer.toSrgbImage();
-        result.elapsedMs = timer.nsecsElapsed() / 1'000'000.0;
-        return result;
+        return;
     }
 
     DetailsEngine::apply(buffer, look.details);
     if (stage == Stage::AfterDetails) {
-        result.image     = buffer.toSrgbImage();
-        result.elapsedMs = timer.nsecsElapsed() / 1'000'000.0;
-        return result;
+        return;
     }
 
     EffectsEngine::apply(buffer, look.effects);
+}
 
-    // ----- Convert back to sRGB for display / export.
-    result.image     = buffer.toSrgbImage();
+ImagePipeline::BufferResult ImagePipeline::renderToBuffer(const QImage& input, Look look) const
+{
+    BufferResult result;
+    if (input.isNull()) return result;
+
+    QElapsedTimer timer;
+    timer.start();
+
+    look.clampRanges();
+    result.wasIdentity = look.isIdentity();
+
+    // fromSrgbImage() dispatches on format, so a 16-bit input stays 16-bit
+    // through linearization. An identity Look still produces a real buffer —
+    // the caller wants pixels, not a short-circuit to a QImage.
+    result.buffer = PixelBuffer::fromSrgbImage(input);
+
+    if (!result.wasIdentity)
+        runEngines(result.buffer, look, Stage::AfterEffects);
+
     result.elapsedMs = timer.nsecsElapsed() / 1'000'000.0;
     return result;
 }

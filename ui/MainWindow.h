@@ -30,6 +30,7 @@
 #include <vector>
 
 QT_BEGIN_NAMESPACE
+class LibraryView;   // ui/LibraryView.h — the catalog workspace
 class QAction;
 class QCheckBox;
 class QDragEnterEvent;
@@ -75,6 +76,11 @@ class MainWindow : public QMainWindow
     Q_OBJECT
 
 public:
+    // Switches to the Library (catalog) workspace, opening the catalog
+    // on first use. Public so the --smoke-test path can exercise the
+    // catalog in CI, where there is no one to click the rail button.
+    void showLibraryWorkspace();
+
     explicit MainWindow(QWidget* parent = nullptr);
     ~MainWindow() override;
 
@@ -188,6 +194,11 @@ private:
     // Professional photo-editor frame: top workspace bar, left icon rail,
     // centered canvas, right inspector, and bottom dock tabs.
     QStackedWidget*      m_workspaceStack = nullptr;
+
+    // Library (catalog) workspace — stack index 2, alongside the
+    // welcome screen (0) and the editor (1).
+    LibraryView*         m_libraryView    = nullptr;
+    int                  m_libraryIndex   = -1;
     WelcomeScreenWidget* m_welcomeScreen  = nullptr;
     QWidget*             m_editorWorkspace = nullptr;
     QWidget*             m_workspaceBar   = nullptr;

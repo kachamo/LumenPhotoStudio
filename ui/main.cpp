@@ -71,6 +71,14 @@ int main(int argc, char* argv[])
 
         MainWindow window;
         window.show();
+
+        // Exercise the Library workspace in smoke mode. Constructing
+        // MainWindow alone never opens the catalog (it is opened lazily on
+        // first use), so without this CI would not compile-and-run a single
+        // line of the SQLite path, the thumbnail cache, or the grid model.
+        if (smokeTest)
+            window.showLibraryWorkspace();
+
         return app.exec();
     } catch (const std::exception& ex) {
         qCritical("Fatal: unhandled exception during startup: %s", ex.what());
