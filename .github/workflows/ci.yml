@@ -21,23 +21,27 @@ permissions:
   contents: read
 
 env:
-  # Qt 6.8.4 — the LTS point release that satisfies both platform constraints:
+  # Qt 6.9.3 — the only version that satisfies all three platforms at once.
+  # Three earlier attempts failed; do not "simplify" this without reading why.
   #
-  #   macOS: must be >= 6.8.4 (or >= 6.9.2). Earlier Qt links the AGL
-  #     framework, which Apple removed from the macOS 26 (Tahoe) SDK that
-  #     `macos-latest` now runs, failing with "ld: framework 'AGL' not found".
-  #     See QTBUG-137687.
-  #   Windows: aqtinstall 3.3.0 cannot resolve repository metadata for the
-  #     6.11.x multi-arch layout ("Failed to locate XML data for Qt version
-  #     6.11.2") though it resolves the 6.8.x layout fine.
+  #   6.8.3  — macOS FAILS. Links the AGL framework, removed from the macOS 26
+  #            (Tahoe) SDK that `macos-latest` runs: "ld: framework 'AGL' not
+  #            found". Fixed upstream in 6.8.4 / 6.9.2 — QTBUG-137687.
+  #   6.8.4  — ALL platforms FAIL. Not published to the online SDK repository
+  #            at all (later Qt LTS patch releases are commercial-only; open
+  #            source stops at 6.8.3). aqt: "Failed to locate XML data".
+  #            It exists under official_releases as SOURCE only.
+  #   6.11.2 — Windows FAILS. 6.11.x uses a newer per-architecture repository
+  #            layout (qt6_6112/qt6_6112_msvc2022_64/) that aqtinstall 3.3.0
+  #            cannot resolve; it probes qt6_6112/qt6_6112/. Linux and macOS
+  #            were green. Revisit only alongside an aqtinstall bump.
+  #   6.9.3  — WORKS: >= 6.9.2 so AGL is fixed, and it still uses the nested
+  #            qt6_693/qt6_693/ layout aqtinstall 3.3.0 resolves. Present for
+  #            windows_x86, linux_x64 and mac_x64.
   #
-  # 6.11.2 was tried and produced green macOS and Ubuntu builds but a red
-  # Windows one, so do not bump to 6.11.x without also bumping aqtinstall.
-  # Do not lower below 6.8.4 or macOS breaks.
-  #
-  # Note this is NOT the developer's local Qt (6.11.2). Pinned exactly (not
-  # "6.8.*") so a run today and a run in six months install the same bits.
-  QT_VERSION: "6.8.4"
+  # Note this is NOT the developer's local Qt (6.11.2). Pinned exactly so a
+  # run today and a run in six months install the same bits.
+  QT_VERSION: "6.9.3"
   BUILD_TYPE: Release
 
 jobs:
