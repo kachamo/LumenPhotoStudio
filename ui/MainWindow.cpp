@@ -711,9 +711,10 @@ void MainWindow::buildUi()
         barLay->addWidget(workspace);
         barLay->addStretch(1);
 
-        auto* status = new QLabel(tr("Workspace Bar Placeholder"), m_workspaceBar);
-        status->setStyleSheet("color: #7A7A7A;");
-        barLay->addWidget(status);
+        // The right-hand side of the workspace bar is intentionally empty. It
+        // previously held a "Workspace Bar Placeholder" label, which is the kind
+        // of scaffolding that quietly ships. Give it real content or leave it
+        // clean — do not reinstate a label that says nothing.
     }
     root->addWidget(m_workspaceBar, 0);
 
@@ -4762,6 +4763,16 @@ bool MainWindow::recoverAutosaveFromPath(const QString& path)
 
 void MainWindow::checkAutosaveRecovery()
 {
+    // Never prompt in a non-interactive run. This dialog is modal, and under
+    // --smoke-test or --screenshot there is nobody to dismiss it — the process
+    // simply hangs until the CI job times out. The smoke test used to outrun it
+    // by quitting on a zero-timer; screenshot mode pumps the event loop to let
+    // layout settle, so it has to be suppressed explicitly.
+    const QStringList args = QCoreApplication::arguments();
+    if (args.contains(QStringLiteral("--smoke-test"))
+        || args.contains(QStringLiteral("--screenshot")))
+        return;
+
     if (!m_autosaveManager || !m_autosaveManager->hasAutosave())
         return;
 

@@ -80,6 +80,10 @@ public:
     // on first use. Public so the --smoke-test path can exercise the
     // catalog in CI, where there is no one to click the rail button.
     void showLibraryWorkspace();
+    void showEditorWorkspace();
+    // Public so --screenshot can populate the editor; an empty editor
+    // makes a poor screenshot of a photo application.
+    bool loadImageFromPath(const QString& path);
 
     explicit MainWindow(QWidget* parent = nullptr);
     ~MainWindow() override;
@@ -119,7 +123,7 @@ private:
     QWidget* buildControlPanel();
     QWidget* buildAnalysisPanel();
     void showWelcomeScreen();
-    void showEditorWorkspace();
+
     void updateBottomWorkspaceVisibility();
     void setBottomWorkspaceCollapsed(bool collapsed);
     void setAnalysisPanelCollapsed(bool collapsed);
@@ -843,7 +847,6 @@ private:
     // shown to the user in that case). Caller is responsible for the
     // unsaved-changes prompt — this method blindly replaces the current
     // image, so the prompt must happen above it if the project is dirty.
-    bool loadImageFromPath(const QString& path);
 
     // Mark the project dirty and refresh the window title. Cheap; safe to
     // call multiple times in a row. Suppressed during project load via

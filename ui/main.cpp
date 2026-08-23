@@ -16,6 +16,9 @@
 #include "lps_build_info.h"
 
 #include <QApplication>
+#include <QDir>
+#include <QEventLoop>
+#include <QPixmap>
 #include <QCoreApplication>
 #include <QGuiApplication>
 #include <QIcon>
@@ -50,8 +53,26 @@ int main(int argc, char* argv[])
     // `LumenPhotoStudio --smoke-test` constructs the main window, pumps the
     // event loop once and exits 0 without needing a display. CI runs it under
     // QT_QPA_PLATFORM=offscreen.
-    const bool smokeTest =
-        QCoreApplication::arguments().contains(QStringLiteral("--smoke-test"));
+    const QStringList args = QCoreApplication::arguments();
+    const bool smokeTest = args.contains(QStringLiteral("--smoke-test"));
+
+    // ---- Screenshot mode ---------------------------------------------------
+    // `LumenPhotoStudio --screenshot <dir>` renders each workspace to PNG and
+    // exits. Needed because this is a GUI application whose README has to show
+    // what it looks like, and because grabbing widgets is the only way to
+    // inspect the interface without a human at the screen. Works under
+    // QT_QPA_PLATFORM=offscreen, so it can run unattended.
+    QString shotDir;
+    const int shotArg = args.indexOf(QStringLiteral("--screenshot"));
+    if (shotArg >= 0 && shotArg + 1 < args.size())
+        shotDir = args.at(shotArg + 1);
+
+    // Optional: `--open <image>` loads a photo first, so the editor screenshot
+    // shows the application doing its job rather than an empty canvas.
+    QString shotImage;
+    const int openArg = args.indexOf(QStringLiteral("--open"));
+    if (openArg >= 0 && openArg + 1 < args.size())
+        shotImage = args.at(openArg + 1);
 
     try {
         // Armed before MainWindow is constructed so this zero-timer is first
@@ -78,6 +99,32 @@ int main(int argc, char* argv[])
         // line of the SQLite path, the thumbnail cache, or the grid model.
         if (smokeTest)
             window.showLibraryWorkspace();
+
+        if (!shotDir.isEmpty()) {
+            QDir().mkpath(shotDir);
+            window.resize(1600, 1000);
+
+            const auto shoot = [&](const QString& name) {
+                // Let layout and any queued paints settle before grabbing.
+                for (int i = 0; i < 8; ++i)
+                    QCoreApplication::processEvents(QEventLoop::AllEvents, 40);
+                const QPixmap pm = window.grab();
+                const QString out = QDir(shotDir).filePath(name + QStringLiteral(".png"));
+                qInfo("screenshot %s -> %s", qPrintable(name),
+                      pm.save(out) ? "ok" : "FAILED");
+            };
+
+            shoot(QStringLiteral("01-welcome"));
+            window.showLibraryWorkspace();
+            shoot(QStringLiteral("02-library"));
+
+            if (!shotImage.isEmpty() && !window.loadImageFromPath(shotImage))
+                qWarning("could not open %s", qPrintable(shotImage));
+            window.showEditorWorkspace();
+            shoot(QStringLiteral("03-editor"));
+
+            return 0;
+        }
 
         return app.exec();
     } catch (const std::exception& ex) {
