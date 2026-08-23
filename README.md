@@ -1,181 +1,157 @@
-# Lumen Photo Studio V1
+# Lumen Photo Studio
 
-Non-destructive photo editing engine. Qt 6 / C++20 / CMake.
+A free, open-source, non-destructive photo editor — a Lightroom
+alternative, built in Qt 6 / C++20.
 
-Engine-only static library — no UI.
+[![CI](https://github.com/kachamo/LumenPhotoStudio/actions/workflows/ci.yml/badge.svg)](https://github.com/kachamo/LumenPhotoStudio/actions/workflows/ci.yml)
+[![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue)](LICENSE)
 
-## Core idea
+> **Project status: early / pre-alpha.** The Develop side of the app (RAW
+> import, tone/color/curve editing, masking, presets, export) is real and
+> under active development. There is **no photo library/catalog yet** — you
+> open one image at a time. If you have a folder of 40,000 photos you need
+> to organize, rate, and search, this project is not ready for that job
+> yet. See [`docs/ROADMAP.md`](docs/ROADMAP.md) for what that gap looks
+> like and what's planned to close it.
 
-```
-RenderResult r = ImagePipeline::render(inputImage, look);
-```
+---
 
-A `Look` is plain data capturing every adjustment. The pipeline is stateless:
-feed it an image and a Look, get a `RenderResult { image, wasIdentity, elapsedMs }`.
+## Screenshots
 
-```
-   UI  ─mutates─▶  Look  ─read by─▶  ImagePipeline  ─produces─▶  RenderResult
-```
+<!-- TODO: add real screenshots before the first tagged release.
+     Suggested shots: main Develop window with an image loaded, the
+     masking/local-adjustments panel, the curve editor, the export dialog.
+     Do not add image links here until the files actually exist in the
+     repo — a 404'd screenshot is worse than no screenshot. -->
 
-## Pipeline (strict order, linear-light internally)
+*(Screenshots coming before the first release. Build it yourself in the
+meantime — see [Building](#building) below.)*
 
-```
-  Input (sRGB QImage)
-     │
-     │  input.copy()            ← the ONE deep pixel copy
-     ▼
-  Working QImage (sRGB)
-     │
-     │  sRGB → Linear (piecewise IEC 61966-2-1, per-channel, via LUT)
-     ▼
-  PixelBuffer (float32 RGBA, linear-light)
-     │
-     ├──▶ ToneEngine           fused 4097-entry LUT: exposure ∘ H/S/W/B ∘ contrast
-     ├──▶ ColorEngine          WhiteBalance → Vibrance/Sat → HSL → RGBMixer
-     ├──▶ CurveEngine          master ∘ per-channel curves (sampled in perceptual space)
-     ├──▶ ColorGrading         .cube LUT + film profile (trilinear, cached)
-     ├──▶ EffectsEngine        Clarity → Grain → Vignette
-     │
-     │  Linear → sRGB (piecewise, via 4096-entry interpolated LUT)
-     ▼
-  Output QImage (sRGB ARGB32)
-```
+## What is this?
 
-Each engine checks `params.isIdentity()` and early-exits. If the whole Look is
-identity, the pipeline short-circuits before even creating the float buffer.
+Lumen Photo Studio is an attempt at a genuinely open-source alternative to
+Adobe Lightroom: a non-destructive RAW/photo editor with a physically
+correct, linear-light color pipeline underneath it. Every edit is stored as
+plain data (a `Look`) rather than baked into pixels, so nothing you do is
+destructive and everything is re-editable later.
 
-## Color accuracy
+It is **not** a Lightroom clone in scope yet — most importantly, it has no
+catalog module (see [Current status](#current-status) below). What it does
+have is a develop/editing engine that we think is already worth building
+on: correct sRGB↔linear conversion (not the common `pow(2.2)` shortcut),
+a fused tone/curve LUT pipeline for real-time preview performance, and a
+genuinely non-destructive editing model from the ground up. The deep
+technical explanation of that pipeline lives in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
-All editing math happens in **linear-light** float32 RGBA. This matters because:
+## Current status
 
-- Exposure is a true multiplier (×2 = +1 stop), not a gamma-curve lie.
-- White balance is physically meaningful per-channel scaling.
-- Contrast pivots at linear middle gray (~0.18), not sRGB 0.5.
-- Vignette multiplication darkens like real light falloff.
-- Blending and LUT sampling produce correct intermediate colors.
+Legend: **Works** = real engine behavior backs the UI control. **Partial**
+= the UI control and its data exist and save/load correctly, but the
+engine does not yet act on it (moving the slider changes nothing in the
+rendered image — this is called out honestly rather than hidden).
+**Planned** = not started.
 
-The conversions use the real **piecewise IEC 61966-2-1 sRGB transfer function**:
+### Import & RAW
 
-```
-sRGB → Linear:  v/12.92                       if v ≤ 0.04045
-                ((v + 0.055) / 1.055)^2.4     otherwise
-```
+| Feature | Status | Notes |
+|---|---|---|
+| Standard image formats (JPEG, PNG, TIFF, etc.) | Works | Via Qt's image plugins. |
+| RAW decode (CR2, CR3, NEF, ARW, DNG, RAF, ORF, RW2) | Works | Via an optional LibRaw dependency, detected at build time; RAW support is silently disabled if LibRaw isn't found. |
+| RAW metadata (camera, lens, ISO, aperture, shutter, focal length, date) | Works | Read via LibRaw for RAW files, via Qt image-plugin text tags for others (coverage for the latter varies by format/platform). |
+| RAW develop settings (white balance mode, highlight recovery, color space, camera profile) | Partial | The controls and data model exist; the RAW decoder does not yet apply them — it always uses camera white balance and an 8-bit sRGB decode regardless. |
+| Full-bit-depth RAW pipeline | Planned | RAW is currently decoded to 8-bit before entering the (otherwise float32) pipeline, discarding most of a RAW file's real dynamic range. |
+| Camera-specific color profiles (DCP/ICC) | Planned | |
+| Lens-correction profiles (Lensfun) | Planned | |
 
-NOT `pow(2.2)`, which is wrong by ~5 counts in the shadow region.
+### Develop
 
-## Memory discipline
+| Feature | Status | Notes |
+|---|---|---|
+| Exposure, contrast, highlights/shadows/whites/blacks, brightness | Works | Fused into a single LUT per render. |
+| White balance, vibrance, saturation, 8-band HSL, RGB channel mixer | Works | |
+| Master + per-channel tone curves | Works | |
+| 3-way color grading (shadows/midtones/highlights color wheels + global tint) | Works | |
+| `.cube` LUT support + film-profile presets | Works | 1D and 3D LUTs. Shaper+3D combined LUTs are not supported. Film profiles are currently just named LUTs, not full curve+response bundles. |
+| Lift / Gamma / Gain / Offset (DaVinci-style) | Partial | UI and data round-trip; no rendering effect yet. |
+| Filmic grading controls (filmic contrast, highlight rolloff, shadow lift, fade blacks, color separation) | Partial | Same as above — UI and data only. |
+| Local adjustments: linear gradient, radial gradient, brush masks | Works | Brush painting is fully implemented (this was previously undocumented/understated). |
+| Crop, rotate, flip, straighten | Works | |
+| Perspective/keystone correction | Planned | |
+| Lens vignetting correction | Works | |
+| Lens distortion / chromatic-aberration correction | Partial | UI and data round-trip; the values are not yet applied to pixels. |
+| Sharpening + luminance/color noise reduction | Works | Real unsharp-mask-style sharpening with edge masking, separate from the Clarity effect below. |
+| Clarity, vignette, film grain effects | Works | Clarity is a midtone-contrast approximation, not a true unsharp-mask (that real behavior lives in Sharpening above). |
+| Adjustment layers with blend modes (Multiply, Screen, Overlay, etc.) | Partial | Full layer-management UI (add/duplicate/delete/opacity/blend mode) and data model exist and persist correctly; layers are **not yet composited into the rendered image**. |
+| Undo/redo, non-destructive project save/load, autosave | Works | |
+| `.lxp` preset format (save/load/organize) | Works | Hardened JSON: schema-versioned, tolerant of missing/malformed fields. |
+| Node-graph pipeline view | Works (read-only) | Visualizes the fixed pipeline stage order; it does not drive rendering and is not an editable node graph. |
+| Plugin manifests (install/enable/browse) | Works | Manages plugin folders/manifests only — there is no runtime that executes plugin code yet. |
+| Export (PNG / JPEG / TIFF) | Works | 8-bit only. |
+| 16-bit export | Planned | |
+| Color-managed export (Adobe RGB, ProPhoto RGB, soft-proofing) | Planned | Export currently assumes sRGB; other color-space options in the export dialog are placeholders. |
+| GPU-accelerated rendering | Planned | Current pipeline is CPU, multi-threaded across scanlines. Fine for preview-resolution editing; will not scale to interactive full-resolution editing on large files. |
 
-- Exactly ONE deep copy of the input QImage per `render()`.
-- All engines mutate the same `PixelBuffer` in place.
-- sRGB↔linear conversions are full-buffer passes, not per-engine.
-- 24 MP image ≈ 384 MB float working buffer. For preview (1800px ≈ 2 MP) this
-  is ~32 MB, which is fine; full-res export trades memory for speed.
+### Library / Catalog
 
-## Identity fast path
+| Feature | Status | Notes |
+|---|---|---|
+| Import workflow, grid/filmstrip browser | Planned | Does not exist. This is the single biggest gap versus Lightroom — see [`docs/ROADMAP.md`](docs/ROADMAP.md). |
+| Ratings, flags, color labels | Planned | |
+| Keywords, collections, search/filter | Planned | |
+| XMP sidecar interop with Lightroom/darktable | Planned | |
 
-Every parameter struct has `isIdentity()` returning true at neutral defaults.
-If `Look::isIdentity()` is true, the pipeline copies input → output with no
-conversion. Engines self-check as a second line of defense.
+For the full gap analysis, phased plan, and effort estimates, see
+[`docs/ROADMAP.md`](docs/ROADMAP.md).
 
-Value parameters have documented ranges enforced by `Look::clampRanges()`,
-called once per render on a local copy of the Look — corrupt presets can't
-damage the pipeline.
+## Building
 
-## Folder layout
+See [`docs/BUILDING.md`](docs/BUILDING.md) for build prerequisites and
+platform-specific instructions (Windows, Linux, macOS). Short version:
+CMake + Qt 6 (Core, Gui, Concurrent, Widgets); LibRaw is optional and only
+needed for RAW file support.
 
-```
-LumenPhotoStudio/
-├── CMakeLists.txt
-├── README.md
-└── src/
-    ├── core/        Look, ImagePipeline, PixelBuffer
-    ├── tone/        ToneEngine, Exposure, Contrast, HighlightsShadows
-    ├── color/       ColorEngine, WhiteBalance, Vibrance, HSL, RGBMixer
-    ├── curve/       CurveEngine, ToneCurve
-    ├── grading/     ColorGrading, LUTLoader, FilmProfiles
-    ├── effects/     EffectsEngine, Vignette, Grain, Clarity
-    ├── preset/      PresetManager, LookSerializer
-    └── util/        ScanlineParallel.h, ColorMath.h, ColorSpace.h
-```
+Packaging/deployment details (windeployqt/macdeployqt, install layout) are
+in [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
-## The Look struct
+## Contributing
 
-```cpp
-struct Look {
-    QString name;
-    int     schemaVersion;
-    ToneParams    tone;     // exposure, contrast, H/S/W/B
-    ColorParams   color;    // WB, vibrance, HSL, RGB mixer
-    CurveParams   curves;   // master + R/G/B curves
-    GradingParams grading;  // LUT path + opacity, film profile id + opacity
-    EffectsParams effects;  // clarity, grain, vignette
+Contributions are welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md) for
+code style, the dev loop, and PR expectations. If you're looking for a
+small, well-scoped first task, the roadmap has a
+["good first issues"](docs/ROADMAP.md#4-good-first-issues) section with
+concrete, verified-against-the-code starting points.
 
-    bool isIdentity() const;
-    void clampRanges();
-    void reset();
-};
-```
+This project follows the [Contributor Covenant](CODE_OF_CONDUCT.md).
 
-Every sub-struct has its own `isIdentity()` and `clampRanges()`. Adding a
-field is a three-file change: `Look.h`, `Look.cpp`, and `LookSerializer.cpp`.
+## Architecture
 
-## .lxp preset format
+The engine's linear-light color pipeline, module map, and the `Look`/
+`ImagePipeline` design are documented in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). If you're curious why the
+color math matters (short version: `pow(2.2)` is wrong and Lumen doesn't
+use it), that's where the detail lives.
 
-Hardened JSON:
+## License
 
-- Missing fields default to identity (forward compat when adding fields)
-- Wrong-type fields are ignored (robust against corruption)
-- NaN/Inf rejected
-- `schemaVersion` recorded; bump for breaking changes; migration hook in place
-- `clampRanges()` applied to every loaded preset
+[GNU General Public License v3.0](LICENSE) — the same license used by
+sibling open-source RAW editors darktable and RawTherapee.
 
-## Performance
+GPL-3.0 was chosen deliberately by the project owner, weighed against MIT,
+Apache-2.0 and MPL-2.0. The reasoning: copyleft keeps a well-resourced
+competitor from taking the community's work closed, and it matches what
+contributors in this niche already expect.
 
-- **LUT fusion** — tone engine fuses exposure+H/S/W/B+contrast into one 4097-
-  entry float LUT with linear interpolation; curve engine fuses master+per-
-  channel curves per RGB plane.
-- **Parallel scanlines** — `forEachScanline` dispatches to QtConcurrent above
-  a 200k-pixel threshold; single-threaded below (dispatch overhead).
-- **LUT cache** — parsed `.cube` files cached by path; re-applying same LUT
-  across renders doesn't re-parse.
-- **Identity short-circuit** — skips pipeline entirely, copies input → output.
+Compatibility notes:
 
-## Usage
+- **Qt (LGPLv3)** — fine. Dynamic linking against the Qt shared libraries,
+  which is what `windeployqt`/`macdeployqt` produce, satisfies LGPLv3's
+  relink requirement regardless of this project's own license.
+- **LibRaw** — dual-licensed LGPL-2.1 **or** CDDL-1.0. The FSF considers
+  CDDL GPL-incompatible, so Lumen consumes LibRaw under the **LGPL-2.1**
+  branch of that dual license. This is the same approach darktable and
+  RawTherapee take. LibRaw is linked dynamically and optionally here
+  (`find_library`, not vendored), which keeps the footprint clean.
 
-```cpp
-#include "core/ImagePipeline.h"
-#include "preset/LookSerializer.h"
-
-lps::Look look;
-look.tone.exposure = 0.3f;
-look.color.whiteBalance.temperature = 8.0f;
-look.grading.lutPath = "/presets/Portra.cube";
-look.grading.lutOpacity = 0.8f;
-
-lps::ImagePipeline pipeline;
-lps::RenderResult r = pipeline.render(input, look);
-// r.image — sRGB-encoded ARGB32 QImage
-// r.wasIdentity — true if Look had no edits
-// r.elapsedMs — render time for profiling
-
-lps::LookSerializer::saveToFile(look, "my_look.lxp");
-```
-
-## Build
-
-```bash
-cmake -S . -B build -DCMAKE_PREFIX_PATH=/path/to/Qt/6.x
-cmake --build build --config Release
-```
-
-Produces `lps_engine` static library.
-
-## Known limitations (V1)
-
-- Vignette roundness parameter is stored but not wired into math
-- Clarity is a midtone-contrast proxy; true unsharp-mask clarity needs a blur pass
-- WB is per-channel multiplication (Lightroom-style); true chromatic adaptation
-  (Bradford matrix) is future work
-- `.cube` parser handles 1D and 3D; shaper + 3D combined LUTs not yet supported
-- Film profile bundles are currently just LUT-paths; curve/response bundling is future
-- No masks, no RAW, no UI (all explicitly excluded from V1)
+Per-file source headers should use the template in
+[`docs/LICENSE-HEADER.txt`](docs/LICENSE-HEADER.txt).

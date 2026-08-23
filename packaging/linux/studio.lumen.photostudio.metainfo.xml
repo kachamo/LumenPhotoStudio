@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    AppStream metainfo for Lumen Photo Studio.
+
+    project_license mirrors the repository LICENSE file (GNU GPL v3, "or any
+    later version" per docs/LICENSE-HEADER.txt). Keep the two in sync.
+-->
+<component type="desktop-application">
+    <id>studio.lumen.photostudio</id>
+    <metadata_license>CC0-1.0</metadata_license>
+    <project_license>GPL-3.0-or-later</project_license>
+
+    <name>Lumen Photo Studio</name>
+    <summary>Non-destructive RAW and photo editor</summary>
+
+    <description>
+        <p>
+            Lumen Photo Studio is a non-destructive photo editor built around a
+            linear-light processing pipeline. Adjustments are stored as an
+            editable recipe rather than baked into pixels, so the original file
+            is never modified.
+        </p>
+        <p>Features include:</p>
+        <ul>
+            <li>Tone, colour, HSL, tone-curve and colour-grading controls</li>
+            <li>Detail, lens-correction, transform and effect stages</li>
+            <li>Local adjustments with mask geometry</li>
+            <li>Camera RAW import (CR2, CR3, NEF, ARW, DNG, RAF, ORF, RW2) when built with LibRaw</li>
+            <li>Reusable presets and project files with autosave recovery</li>
+        </ul>
+    </description>
+
+    <launchable type="desktop-id">studio.lumen.photostudio.desktop</launchable>
+
+    <categories>
+        <category>Graphics</category>
+        <category>Photography</category>
+        <category>RasterGraphics</category>
+    </categories>
+
+    <url type="homepage">https://github.com/kachamo/LumenPhotoStudio</url>
+    <url type="bugtracker">https://github.com/kachamo/LumenPhotoStudio/issues</url>
+
+    <provides>
+        <binary>LumenPhotoStudio</binary>
+    </provides>
+
+    <content_rating type="oars-1.1"/>
+</component>

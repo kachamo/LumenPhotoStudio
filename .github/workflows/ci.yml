@@ -1,0 +1,232 @@
+name: CI
+
+# Proves LumenPhotoStudio actually compiles AND runs (via --smoke-test) on
+# Windows, Linux and macOS. See CMakeLists.txt for the build contract this
+# workflow depends on: target/OUTPUT_NAME "LumenPhotoStudio",
+# CMAKE_RUNTIME_OUTPUT_DIRECTORY = <build>/bin, MACOSX_BUNDLE ON on macOS.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel superseded runs on the same branch/PR so the matrix doesn't queue up.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Qt 6.9.3 — the only version that satisfies all three platforms at once.
+  # Three earlier attempts failed; do not "simplify" this without reading why.
+  #
+  #   6.8.3  — macOS FAILS. Links the AGL framework, removed from the macOS 26
+  #            (Tahoe) SDK that `macos-latest` runs: "ld: framework 'AGL' not
+  #            found". Fixed upstream in 6.8.4 / 6.9.2 — QTBUG-137687.
+  #   6.8.4  — ALL platforms FAIL. Not published to the online SDK repository
+  #            at all (later Qt LTS patch releases are commercial-only; open
+  #            source stops at 6.8.3). aqt: "Failed to locate XML data".
+  #            It exists under official_releases as SOURCE only.
+  #   6.11.2 — Windows FAILS. 6.11.x uses a newer per-architecture repository
+  #            layout (qt6_6112/qt6_6112_msvc2022_64/) that aqtinstall 3.3.0
+  #            cannot resolve; it probes qt6_6112/qt6_6112/. Linux and macOS
+  #            were green. Revisit only alongside an aqtinstall bump.
+  #   6.9.3  — WORKS: >= 6.9.2 so AGL is fixed, and it still uses the nested
+  #            qt6_693/qt6_693/ layout aqtinstall 3.3.0 resolves. Present for
+  #            windows_x86, linux_x64 and mac_x64.
+  #
+  # Note this is NOT the developer's local Qt (6.11.2). Pinned exactly so a
+  # run today and a run in six months install the same bits.
+  QT_VERSION: "6.9.3"
+  BUILD_TYPE: Release
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      # One platform failing should never hide the results of the other two.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    # windows-latest's default shell is PowerShell. Forcing bash everywhere
+    # is the single biggest source of flakiness reduction in a 3-OS matrix:
+    # every step below runs through the same interpreter on all platforms.
+    # windows-latest ships Git Bash out of the box, so this needs no setup.
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # --------------------------------------------------------------------
+      # Linux-only system packages.
+      #
+      # Qt Widgets (even run headless via QT_QPA_PLATFORM=offscreen) needs
+      # the usual xkb/EGL/xcb runtime bits to load its platform plugins and
+      # to link against GL. jurplel/install-qt-action also runs `apt-get
+      # install` for a baseline set of Qt dependencies by default
+      # (install-deps: true), so some overlap here is expected and harmless
+      # — this list is a defensive superset for a Widgets app specifically.
+      # --------------------------------------------------------------------
+      - name: Install Linux Qt/Widgets runtime dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgl1-mesa-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-0 \
+            libxcb-cursor0 \
+            libxcb-icccm4 \
+            libxcb-image0 \
+            libxcb-keysyms1 \
+            libxcb-randr0 \
+            libxcb-render-util0 \
+            libxcb-shape0 \
+            libxcb-xfixes0 \
+            libxcb-xinerama0 \
+            libegl1 \
+            libfontconfig1 \
+            libfreetype6
+
+      # --------------------------------------------------------------------
+      # DELIBERATE asymmetric coverage of the optional LibRaw dependency.
+      #
+      # CMakeLists.txt discovers LibRaw via pkg-config / find_path /
+      # find_library and gates it behind LPS_HAS_LIBRAW + the compile define
+      # LPS_HAS_LIBRAW=1 — it is never a hard requirement.
+      #
+      #   - Ubuntu installs libraw-dev, so LPS_HAS_LIBRAW=ON here and the
+      #     "#if LPS_HAS_LIBRAW" RAW-decoding code path is actually compiled
+      #     and smoke-tested.
+      #   - Windows and macOS deliberately do NOT install LibRaw, so
+      #     LPS_HAS_LIBRAW=OFF there and the "RAW support disabled" fallback
+      #     path is exercised instead.
+      #
+      # Between the three legs of this matrix, both branches of the optional
+      # dependency are compiled and run on every single CI run. Do not "fix"
+      # this by installing LibRaw everywhere or nowhere — that would silently
+      # drop coverage of one branch.
+      # --------------------------------------------------------------------
+      - name: Install LibRaw (Ubuntu only — see comment above)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y --no-install-recommends libraw-dev
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          target: desktop
+          # Qt >=6.8 desktop Windows builds ship as win64_msvc2022_64 (this
+          # action's own documented default for Qt 6.8+, made explicit here
+          # rather than relied upon). Linux/macOS arch is left unset so
+          # aqtinstall picks the correct gcc_64 / clang_64 build itself.
+          arch: ${{ runner.os == 'Windows' && 'win64_msvc2022_64' || '' }}
+          cache: true
+
+      - name: Configure (CMake)
+        run: |
+          set -euo pipefail
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
+            -DCMAKE_PREFIX_PATH="${QT_ROOT_DIR}" \
+            | tee cmake-configure.log
+
+      # Makes the "deliberate asymmetric LibRaw coverage" claim above an
+      # actual CI assertion instead of just a comment: fail loudly if a
+      # platform's LPS_HAS_LIBRAW result doesn't match what this matrix
+      # intends for it.
+      - name: Verify LibRaw detection matches intended per-OS coverage
+        run: |
+          set -euo pipefail
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            if ! grep -q "LibRaw found: RAW support enabled" cmake-configure.log; then
+              echo "::error::Expected LibRaw to be detected on Ubuntu (libraw-dev installed) but LPS_HAS_LIBRAW came back OFF. RAW code path is not being verified."
+              exit 1
+            fi
+          else
+            if ! grep -q "LibRaw not found: RAW support disabled" cmake-configure.log; then
+              echo "::error::Expected LibRaw to be ABSENT on ${{ runner.os }} but CMake detected it. The 'LibRaw disabled' fallback path is not being exercised on this platform."
+              exit 1
+            fi
+          fi
+
+      - name: Build
+        run: cmake --build build --config "${BUILD_TYPE}" --parallel
+
+      # ----------------------------------------------------------------------
+      # Locate the built executable.
+      #
+      # CMAKE_RUNTIME_OUTPUT_DIRECTORY is <build>/bin everywhere, but the
+      # exact leaf differs:
+      #   - Windows (multi-config VS generator): build/bin/Release/LumenPhotoStudio.exe
+      #   - Linux   (single-config Makefiles):     build/bin/LumenPhotoStudio
+      #   - macOS   (single-config, MACOSX_BUNDLE): build/bin/LumenPhotoStudio.app/Contents/MacOS/LumenPhotoStudio
+      # A `find` fallback covers any generator-default variation (e.g. a
+      # runner image that defaults to Ninja Multi-Config) without hardcoding
+      # every possible layout.
+      # ----------------------------------------------------------------------
+      - name: Locate built binary
+        id: locate
+        run: |
+          set -euo pipefail
+          CANDIDATES=(
+            "build/bin/${BUILD_TYPE}/LumenPhotoStudio.exe"
+            "build/bin/LumenPhotoStudio.exe"
+            "build/bin/${BUILD_TYPE}/LumenPhotoStudio.app/Contents/MacOS/LumenPhotoStudio"
+            "build/bin/LumenPhotoStudio.app/Contents/MacOS/LumenPhotoStudio"
+            "build/bin/${BUILD_TYPE}/LumenPhotoStudio"
+            "build/bin/LumenPhotoStudio"
+          )
+          FOUND=""
+          for c in "${CANDIDATES[@]}"; do
+            if [ -f "$c" ]; then
+              FOUND="$c"
+              break
+            fi
+          done
+          if [ -z "$FOUND" ]; then
+            echo "No known candidate path matched; searching build/bin recursively..."
+            FOUND=$(find build/bin -type f \( -iname 'LumenPhotoStudio' -o -iname 'LumenPhotoStudio.exe' \) 2>/dev/null | head -n1)
+          fi
+          if [ -z "$FOUND" ]; then
+            echo "::error::Could not locate the LumenPhotoStudio binary under build/bin"
+            echo "Contents of build/bin:"
+            find build/bin 2>/dev/null || echo "(build/bin does not exist)"
+            exit 1
+          fi
+          echo "Located binary at: $FOUND"
+          echo "binary=$FOUND" >> "$GITHUB_OUTPUT"
+
+      # The single most valuable step in this pipeline: proves the app
+      # actually runs, not just links. --smoke-test (added alongside this CI
+      # by another change) constructs the main window, pumps the event loop
+      # and exits 0 without needing a real display — QT_QPA_PLATFORM=offscreen
+      # is what makes that possible with no X server / window compositor.
+      - name: Run smoke test (offscreen)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          set -euo pipefail
+          "${{ steps.locate.outputs.binary }}" --smoke-test
+          echo "Smoke test exited 0 on ${{ runner.os }}"
+
+      - name: Install to staging prefix
+        run: cmake --install build --config "${BUILD_TYPE}" --prefix "${{ github.workspace }}/stage"
+
+      - name: Upload staged build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LumenPhotoStudio-${{ matrix.os }}
+          path: stage/
+          if-no-files-found: error
+          retention-days: 7

@@ -1,0 +1,128 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    Lumen Photo Studio - macOS bundle Info.plist template.
+
+    CMake runs configure_file on this file into the build tree and points
+    the target MACOSX_BUNDLE_INFO_PLIST property at the result. Every
+    placeholder token below must have a matching set() in the top-level
+    CMakeLists.txt.
+-->
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>@LPS_BUNDLE_EXECUTABLE@</string>
+    <key>CFBundleIdentifier</key>
+    <string>@LPS_BUNDLE_ID@</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>@LPS_APP_NAME@</string>
+    <key>CFBundleDisplayName</key>
+    <string>@LPS_APP_NAME@</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleSignature</key>
+    <string>????</string>
+    <key>CFBundleVersion</key>
+    <string>@LPS_APP_VERSION@</string>
+    <key>CFBundleShortVersionString</key>
+    <string>@LPS_APP_VERSION@</string>
+    <key>CFBundleIconFile</key>
+    <string>@LPS_BUNDLE_ICON_FILE@</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>@LPS_APP_COPYRIGHT@</string>
+
+    <!-- Retina rendering and dark-mode support. The UI ships its own dark
+         stylesheet, so the system must not force the legacy Aqua look. -->
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSRequiresAquaSystemAppearance</key>
+    <false/>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.photography</string>
+
+    <!-- Document types the app can open. Extensions mirror the file dialog
+         filters in ui/MainWindow.cpp. -->
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Image</string>
+            <key>CFBundleTypeRole</key>
+            <string>Editor</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>CFBundleTypeExtensions</key>
+            <array>
+                <string>jpg</string>
+                <string>jpeg</string>
+                <string>png</string>
+                <string>tif</string>
+                <string>tiff</string>
+                <string>bmp</string>
+                <string>webp</string>
+            </array>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>public.jpeg</string>
+                <string>public.png</string>
+                <string>public.tiff</string>
+                <string>com.microsoft.bmp</string>
+                <string>org.webmproject.webp</string>
+            </array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Camera RAW Image</string>
+            <key>CFBundleTypeRole</key>
+            <string>Editor</string>
+            <key>LSHandlerRank</key>
+            <string>Alternate</string>
+            <key>CFBundleTypeExtensions</key>
+            <array>
+                <string>cr2</string>
+                <string>cr3</string>
+                <string>nef</string>
+                <string>arw</string>
+                <string>dng</string>
+                <string>raf</string>
+                <string>orf</string>
+                <string>rw2</string>
+            </array>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>public.camera-raw-image</string>
+            </array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Lumen Project</string>
+            <key>CFBundleTypeRole</key>
+            <string>Editor</string>
+            <key>LSHandlerRank</key>
+            <string>Owner</string>
+            <key>CFBundleTypeExtensions</key>
+            <array>
+                <string>lps</string>
+                <string>lpsproj</string>
+            </array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Lumen Preset</string>
+            <key>CFBundleTypeRole</key>
+            <string>Editor</string>
+            <key>LSHandlerRank</key>
+            <string>Owner</string>
+            <key>CFBundleTypeExtensions</key>
+            <array>
+                <string>lxp</string>
+                <string>lpreset</string>
+            </array>
+        </dict>
+    </array>
+</dict>
+</plist>
